@@ -39,6 +39,12 @@ Detailed before/after numbers and commentary live in the user's primary repo:
 
 ---
 
+## v4 patches (on top of v3)
+
+| File | What changed | Why |
+| --- | --- | --- |
+| `rag_system/agent/loop.py` | Added `Agent._retry_synthesis()`. The verifier block now runs `hard_groundedness_check` first; if it FAILs and there's at least one actionable flag (`UNGROUNDED_CITE`, `MISCITED`, `PHANTOM_SOURCE`) and total elapsed time is under `GROUNDEDNESS_RETRY_LATENCY_BUDGET` (default 180 s), the agent re-synthesises once with a sterner prompt that includes the rejected answer + the explicit flags + the raw snippet text. The retry adopts the new answer only if its own deterministic-check has *fewer* flags than the original. Footer carries `retry={improved\|no_improvement} (+Xs)`. Env knobs: `GROUNDEDNESS_RETRY=0` disables; `GROUNDEDNESS_RETRY_LATENCY_BUDGET=N` overrides the budget. | The v3 stack flagged ungrounded cites correctly but emitted them anyway. v4's retry closes the loop: on the CLP eval, Q1 went FAIL → pass (+26.1 s) and started citing `8 C.F.R § 1208.13(c)` — the exact reg every prior run had missed. |
+
 ## v3 patches (on top of v2)
 
 | File | What changed | Why |
@@ -50,39 +56,39 @@ Detailed before/after numbers and commentary live in the user's primary repo:
 
 ## Headline before/after
 
-| | Baseline | v2 patched | **v3** |
-| --- | --- | --- | --- |
-| Q1 (verbatim "CLP") | 2/10 | 6/10 | **7/10** |
-| Q2 (expanded CLP) | 7/10 | 8.5/10 | **9/10** |
-| Q2 mis-attribution | n/a | present (`[S1, 1208.33(a)(3)]` for `1208.13(c)`) | **gone, deterministic_check=pass** |
-| Composite (Q1+Q2) | 45% | 73% | **80%** |
-| `chunk_size` honored from snake_case POST | — | ❌ ignored | ✅ honored |
-| Q2 latency | 262 s | 51 s | **44 s** |
+| | Baseline | v2 patched | v3 (deterministic) | **v4 (retry)** |
+| --- | --- | --- | --- | --- |
+| Q1 (verbatim "CLP") | 2/10 | 6/10 | 7/10 | **9/10** |
+| Q2 (expanded CLP) | 7/10 | 8.5/10 | 9/10 | **9.5/10** |
+| Q1 cites `1208.13(c)` | ❌ | ❌ | ❌ | **✅** |
+| Q2 cites `1208.13(c)` | ❌ | ❌ | ❌ | **✅** |
+| Q2 mis-attribution | n/a | present (`[S1, 1208.33(a)(3)]` for `1208.13(c)`) | gone | gone |
+| Composite (Q1+Q2) | 45% | 73% | 80% | **92.5%** |
+| Q3+Q4 included composite | n/a | 82.5% | n/a | **91.25%** |
+| `chunk_size` honored from snake_case POST | — | ❌ ignored | ✅ honored | ✅ honored |
+| Q1 latency | 82 s | 95 s | 71 s | 98 s (+26 retry) |
+| Q2 latency | 262 s | 51 s | 44 s | 60 s (+16 retry) |
 
 ---
 
-## Known-remaining defects (after v3)
+## Known-remaining defects (after v4)
 
-1. **Synthesis still under-utilises retrieved chunks on Q1.** The most relevant CFR
-   subsection (`1208.33(a)(2)(ii)`, family-with-whom-traveling exception) was in
-   the retrieved set on multiple runs but didn't make it into the answer. The
-   deterministic check correctly flags the answer as `FAIL` (model leaned on
-   parametric knowledge for `INA § 208(b)(3)(A)`, which has 0 occurrences in
-   Q1's 7 retrieved chunks), but doesn't *fix* the underlying retrieval/synthesis
-   gap.
-2. **No retry on `deterministic_check=FAIL`.** "Fix #2" from the v2→v3 handoff
-   was intentionally skipped — it requires a small plumbing change to
-   `retrieval_pipeline.run()` to accept an extra prompt addendum. Expected lift
-   on Q1 is +1 to +2 points at the cost of ~80 s extra latency.
-3. **The deterministic check is purely textual.** It can't catch *semantic*
-   mis-attribution where the cite is plausibly nearby in the chunk (model
-   paraphrases sentence A but cites the regulation from sentence B in the same
-   chunk). Would need claim-level alignment, probably via NLI. Out of scope for
-   this patch series.
-4. **Verifier still emits `verifier_score=N%`** alongside the deterministic
-   verdict. It's now clearly labelled `verifier(llm)=...`, but a downstream
-   caller that regex-greps `\d+%` could still be misled. Clean follow-up:
-   drop the percentage and only emit `verifier(llm)={supported,partially_supported,not_supported}`.
+1. **`retrieval_k=20` may be too small for cross-cutting questions.** Q3 v4
+   surfaced `1208.17(a)` (the deferral-granting reg — the "only miss" in v2) but
+   in the same retrieval lost the 9th Circuit case cites (*Lopez-Cardona*,
+   *Annachamy*). Quick test: bump to 30.
+2. **The deterministic check is purely textual.** It can't catch *semantic*
+   mis-attribution where the cite is plausibly nearby in the chunk. Would need
+   claim-level alignment, probably via NLI.
+3. **Verifier(llm) still emits a numeric `verifier_score=N%`.** It's now
+   clearly labelled, but a naive consumer regex-grepping `\d+%` could still
+   be misled. Clean follow-up: drop the percentage; emit only the categorical
+   `{supported, partially_supported, not_supported}` verdict.
+4. **Retry inflates the prompt context.** With 6+ snippets × ~1500 chars each,
+   the retry prompt approaches the 8k–16k token range. For larger source sets,
+   filter to the top re-ranked snippets (e.g. top 5) before the retry.
+5. **Coverage still narrow.** Four questions on one PDF. Precision/recall of
+   `hard_groundedness_check` against a labelled set hasn't been measured.
 
 ---
 

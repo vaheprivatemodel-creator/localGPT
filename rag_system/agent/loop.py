@@ -677,15 +677,54 @@ FINAL ANSWER:
             
         if verification_enabled and result.get("source_documents"):
             context_str = "\n".join([doc['text'] for doc in result['source_documents']])
-            verification = await self.verifier.verify_async(contextual_query, context_str, result['answer'])
 
-            # --- Grounded verifier footer (deterministic check + LLM verifier) ---
-            # The deterministic check is the source of truth for pass/FAIL.
-            # The LLM verifier is shown for transparency but no longer used to decide groundedness.
+            # --- Deterministic groundedness check (pre-verifier) ---
             gc = hard_groundedness_check(
                 result.get('answer', ''),
                 result.get('source_documents', []) or [],
             )
+
+            # --- Fix #2: retry-on-FAIL with a sterner prompt ---
+            # If the deterministic check fails AND we have a latency budget, re-synthesize
+            # once with the failure flags surfaced to the model.
+            retry_meta = {"attempted": False, "improved": False, "latency": 0.0}
+            retry_enabled = os.environ.get("GROUNDEDNESS_RETRY", "1") != "0"
+            elapsed_so_far = time.time() - start_time
+            latency_budget = float(os.environ.get("GROUNDEDNESS_RETRY_LATENCY_BUDGET", "180"))
+            actionable_flags = [f for f in gc['flags'] if not f.startswith("NO_INLINE_CITATIONS")]
+            if (
+                retry_enabled
+                and not gc['passed']
+                and actionable_flags
+                and elapsed_so_far < latency_budget
+            ):
+                retry_meta["attempted"] = True
+                retry_t0 = time.time()
+                print(f"🔁 retry-on-FAIL: re-synthesizing (flags={gc['flags']})")
+                try:
+                    revised = await self._retry_synthesis(
+                        contextual_query=contextual_query,
+                        source_documents=result.get('source_documents', []) or [],
+                        original_answer=result.get('answer', ''),
+                        flags=gc['flags'],
+                    )
+                    if revised and revised.strip():
+                        # Re-run deterministic check on the revised answer; only adopt
+                        # if it didn't make things worse.
+                        gc_retry = hard_groundedness_check(revised, result.get('source_documents', []) or [])
+                        if len(gc_retry['flags']) < len(gc['flags']) or gc_retry['passed']:
+                            print(f"🔁 retry improved: flags {len(gc['flags'])} -> {len(gc_retry['flags'])}")
+                            result['answer'] = revised
+                            gc = gc_retry
+                            retry_meta["improved"] = True
+                        else:
+                            print(f"🔁 retry did not improve (flags {len(gc['flags'])} -> {len(gc_retry['flags'])}); keeping original")
+                except Exception as e:
+                    print(f"⚠️ retry synthesis failed: {e}")
+                retry_meta["latency"] = time.time() - retry_t0
+
+            # LLM verifier runs AFTER the optional retry so it grades the final answer.
+            verification = await self.verifier.verify_async(contextual_query, context_str, result['answer'])
 
             verdict = (verification.verdict or "UNKNOWN").lower()
             grounded = "yes" if verification.is_grounded else "no"
@@ -698,6 +737,9 @@ FINAL ANSWER:
             ]
             if verification.confidence_score and verification.confidence_score > 0:
                 footer_parts.append(f"verifier_score={verification.confidence_score}%")
+            if retry_meta["attempted"]:
+                tag = "improved" if retry_meta["improved"] else "no_improvement"
+                footer_parts.append(f"retry={tag} (+{retry_meta['latency']:.1f}s)")
             footer = " [" + " | ".join(footer_parts) + "]"
 
             if not gc['passed']:
@@ -727,6 +769,81 @@ FINAL ANSWER:
         print(f"🚀 Total query processing time: {total_time:.2f}s")
         
         return result
+
+    # ------------------------------------------------------------------
+    async def _retry_synthesis(
+        self,
+        contextual_query: str,
+        source_documents: list,
+        original_answer: str,
+        flags: list,
+    ) -> str:
+        """Re-synthesize the answer with the failure flags surfaced to the model.
+
+        Used by Fix #2 (retry-on-deterministic_check=FAIL). The retry prompt asks
+        the model to quote-then-answer from the raw snippets, removing any claim
+        whose supporting citation isn't literally in the corpus.
+        """
+        # Strip any prior footer from the previous answer so the model doesn't
+        # echo the deterministic-check status back at us.
+        prior = original_answer.split('[deterministic_check=')[0].rstrip()
+
+        snippet_block_parts = []
+        for i, doc in enumerate(source_documents):
+            text = (doc.get('text') or '').strip()
+            snippet_block_parts.append(f"[S{i + 1}] (chunk_id={doc.get('chunk_id', 'n/a')})\n{text}")
+        snippet_block = "\n\n".join(snippet_block_parts)
+
+        n_sources = len(source_documents)
+        flags_block = "\n".join(f"- {f}" for f in flags) if flags else "- (none)"
+
+        retry_prompt = f"""You are revising a previous answer that was REJECTED by an automated
+groundedness check. Your job is to produce a corrected answer that passes the check.
+
+ORIGINAL QUESTION:
+"{contextual_query}"
+
+YOUR PREVIOUS ANSWER (rejected):
+{prior}
+
+FAILURE FLAGS — you must fix every one of these:
+{flags_block}
+
+RETRIEVED SNIPPETS — these are your ONLY source of truth. Any regulation cite
+in your revised answer (e.g. "8 C.F.R. § X.Y(z)" or "INA § X(y)") MUST appear
+literally in one of these snippets, character for character. If a citation
+from your previous answer is not present below, REMOVE IT.
+
+{snippet_block}
+
+INSTRUCTIONS:
+1. Re-read every snippet, slowly. For EACH snippet you intend to cite, quote
+   (mentally) the single most relevant sentence before writing your final
+   answer.
+2. Write a revised final answer to the ORIGINAL QUESTION. Every factual claim
+   must end with [S#] where 1 <= S# <= {n_sources}.
+3. If you cite a regulation, the exact section number (e.g. "1208.33(a)(2)(ii)"
+   or "208(b)(3)(A)") MUST be present in the snippet you tag. Verify each one.
+4. If a claim from your previous answer was based on knowledge not in any
+   snippet, REMOVE the claim.
+5. If the question genuinely cannot be answered from the snippets, say so
+   explicitly and state what the snippets DO cover. This is a valid answer
+   shape — do not invent content to fill the gap.
+6. Use a factual, third-person tone. 3-10 sentences is appropriate; do NOT
+   restate the flags or this prompt back to the user.
+7. Do NOT append a "[Confidence: N%]" or "[deterministic_check=...]" line —
+   those are added by a separate verifier.
+
+REVISED ANSWER:
+"""
+
+        revised_parts: list = []
+        for tok in self.llm_client.stream_completion(
+            model=self.ollama_config["generation_model"],
+            prompt=retry_prompt,
+        ):
+            revised_parts.append(tok)
+        return "".join(revised_parts).strip()
 
     # ------------------------------------------------------------------
     def _route_via_overviews(self, query: str) -> str | None:
