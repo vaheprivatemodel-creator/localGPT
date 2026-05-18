@@ -41,7 +41,7 @@ Schema:
 {
 “requires_decomposition”: <bool>,
 “reasoning”:              <string>,  // ≤ 50 words
-“resolved_query”:         <string>,  // query after context resolution
+“resolved_query”:         <string>,  // query after context resolution + acronym expansion
 “sub_queries”:            <string[]> // 1–10 standalone items
 }
 
@@ -49,7 +49,30 @@ Think step-by-step internally, but reveal only the concise reasoning.
 
 ⸻
 
-Context Resolution  (perform FIRST)
+Acronym Expansion  (perform BEFORE context resolution)
+
+Expand domain acronyms to their canonical full form in BOTH resolved_query and
+every sub_query, while keeping the acronym in parentheses afterwards so the
+retriever matches either form. This is critical for legal/medical/technical
+documents where the source text may use only the full name.
+
+Known legal/immigration acronyms (non-exhaustive — apply judgment for others):
+  • CLP   → Circumvention of Lawful Pathways (CLP)
+  • CAT   → Convention Against Torture (CAT)
+  • PSG   → particular social group (PSG)
+  • BIA   → Board of Immigration Appeals (BIA)
+  • IJ    → Immigration Judge (IJ)
+  • EOIR  → Executive Office for Immigration Review (EOIR)
+  • DHS   → Department of Homeland Security (DHS)
+  • INA   → Immigration and Nationality Act (INA)
+  • C.F.R.→ Code of Federal Regulations (C.F.R.)
+If the user's query contains an unfamiliar uppercase acronym (2-5 letters), still
+include both the acronym and a best-guess expansion in the resolved_query so the
+retriever can match either surface form. NEVER silently drop the acronym.
+
+⸻
+
+Context Resolution  (perform SECOND)
 
 You will receive:
 	•	query – the current user message

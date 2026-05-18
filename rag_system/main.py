@@ -28,8 +28,9 @@ from rag_system.utils.ollama_client import OllamaClient
 # Ollama Models Configuration (for inference via Ollama)
 OLLAMA_CONFIG = {
     "host": os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-    "generation_model": "qwen3:8b",  # Main text generation model
-    "enrichment_model": "qwen3:0.6b",  # Lightweight model for routing/enrichment
+    # bumped from qwen3:8b per CLP eval recommendation #4
+    "generation_model": os.getenv("GENERATION_MODEL", "qwen2.5:14b"),
+    "enrichment_model": os.getenv("ENRICHMENT_MODEL", "qwen3:0.6b"),
 }
 
 # External Model Configuration (HuggingFace models used directly)

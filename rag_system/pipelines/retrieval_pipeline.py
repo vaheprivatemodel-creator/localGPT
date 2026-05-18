@@ -222,21 +222,35 @@ class RetrievalPipeline:
 You are an AI assistant specialised in answering questions from retrieved context.
 
 Context you receive
-• VERIFIED FACTS – text snippets retrieved from the user's documents. Some may be irrelevant noise.  
+• VERIFIED FACTS – text snippets retrieved from the user's documents, each tagged with a
+  short label like [S1], [S2], …. Some may be irrelevant noise.
 • ORIGINAL QUESTION – the user's actual query.
 
 Instructions
-1. Evaluate each snippet for relevance to the ORIGINAL QUESTION; ignore those that do not help answer it.  
-2. Synthesise an answer **using only information from the relevant snippets**.  
-3. If snippets contradict one another, mention the contradiction explicitly.  
-4. If the snippets do not contain the needed information, reply exactly with:  
-   "I could not find that information in the provided documents."  
-5. Provide a thorough, well-structured answer. Use paragraphs or bullet points where helpful, and include any relevant numbers/names exactly as they appear. There is **no strict sentence limit**, but aim for clarity over brevity.  
-6. Do **not** introduce external knowledge unless step 4 applies; in that case you may add a clearly-labelled "General knowledge" sentence after the required statement.
+1. ACRONYM RESOLUTION: If the question uses an uppercase acronym (e.g. CLP, CAT, PSG),
+   first scan the snippets for the canonical spelled-out form (e.g. "Circumvention of
+   Lawful Pathways", "Convention Against Torture", "particular social group"). Treat the
+   acronym and the spelled-out form as the same concept. Never claim the snippets "do not
+   mention" an acronym just because they use the full name instead.
+2. Evaluate each snippet for relevance to the ORIGINAL QUESTION; ignore those that do not help.
+3. Synthesise an answer **using only information from the relevant snippets**.
+4. INLINE CITATIONS REQUIRED: For every factual claim, cite the supporting snippet(s)
+   inline using their bracketed label(s), e.g. "Derivative beneficiaries may follow-to-join
+   under INA § 208(b)(3)(A) [S3][S7]." A claim without a citation is invalid. When the
+   snippet itself contains a regulation cite (e.g. 8 C.F.R. § 1208.33(a)(2)(ii)) quote that
+   cite alongside the label, e.g. "[S3, 8 C.F.R. § 1208.33(a)(2)(ii)]".
+5. If snippets contradict one another, mention the contradiction explicitly with citations.
+6. If the snippets genuinely do not contain the needed information AFTER acronym resolution,
+   reply: "I could not find that information in the provided documents." and then briefly
+   state what the documents DO cover that is adjacent (with citations).
+7. Provide a thorough, well-structured answer. Use paragraphs or bullet points where helpful.
+8. Do NOT append a "[Confidence: N%]" line — that is added by a separate verifier.
+9. Do NOT introduce external knowledge unless step 6 applies; if you do, label the sentence
+   "General knowledge:".
 
 Output format
 Answer:
-<your answer here>
+<your answer here, with inline [S#] citations on every factual claim>
 
 –––––  Retrieved Snippets  –––––
 {facts}
@@ -495,7 +509,12 @@ ORIGINAL QUESTION: "{query}"
                 if key in doc:
                     doc[key] = _clean_val(doc[key])
 
-        context = "\n\n".join([doc['text'] for doc in final_docs])
+        # Label each snippet [S1], [S2], … so the generator can produce inline citations.
+        # The full chunk_id is also included for traceability.
+        context = "\n\n".join(
+            f"[S{i+1}] (chunk_id={doc.get('chunk_id','?')})\n{doc['text']}"
+            for i, doc in enumerate(final_docs)
+        )
 
         # 👀 DEBUG: Show the exact context passed to the LLM after pruning
         print("\n=== Context passed to LLM (post-pruning) ===")

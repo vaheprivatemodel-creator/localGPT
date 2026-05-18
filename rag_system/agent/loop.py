@@ -10,6 +10,68 @@ from rag_system.agent.verifier import Verifier
 from rag_system.retrieval.query_transformer import QueryDecomposer, GraphQueryTranslator
 from rag_system.retrieval.retrievers import GraphRetriever
 
+import re as _gc_re
+
+
+def hard_groundedness_check(answer: str, source_documents: list) -> dict:
+    """Deterministic groundedness check — no LLM. Returns dict with `flags` and `passed`.
+
+    Catches:
+      - PHANTOM_SOURCE: answer cites [S5] but only 4 sources retrieved
+      - MISCITED: answer says [S1, 8 C.F.R. § 1208.33(a)(3)] but that reg is not in S1's text
+      - UNGROUNDED_CITE: answer mentions a CFR/INA reg that appears in NO retrieved source
+      - NO_INLINE_CITATIONS: answer has 0 [S#] tags but sources were retrieved
+    """
+    flags = []
+    src_texts = [(d.get('text') or '') for d in (source_documents or [])]
+
+    def _norm(s: str) -> str:
+        # Aggressive normalization: drop all whitespace, periods, and the section sign
+        # so cite-like punctuation variants ("8 C.F.R. §" vs "8 C.F.R §" vs "8 CFR §")
+        # don't produce false positives.
+        s = _gc_re.sub(r'\s+', '', s)
+        s = s.replace('§', '')
+        s = s.replace('.', '')
+        return s.lower()
+
+    def _signature(cite: str) -> str:
+        # The *meaningful* part of a cite is the numeric section, e.g. "1208.33(a)(2)(ii)"
+        # or "208(b)(3)(A)". Extract it and normalize. Falls back to the full cite if no
+        # numeric section is found.
+        m = _gc_re.search(r'\d+\.\d+(?:\([a-z0-9]+\))*|\d+\([^\)]*\)(?:\([^\)]*\))*', cite, _gc_re.IGNORECASE)
+        return _norm(m.group(0)) if m else _norm(cite)
+
+    norm_sources = [_norm(t) for t in src_texts]
+
+    for s_idx in _gc_re.findall(r'\[S(\d+)', answer):
+        if int(s_idx) > len(src_texts) or int(s_idx) < 1:
+            flags.append(f"PHANTOM_SOURCE: S{s_idx} doesn't exist (only {len(src_texts)} sources)")
+
+    for s_idx, sub in _gc_re.findall(r'\[S(\d+)\s*,\s*([^\]]+?)\]', answer):
+        idx = int(s_idx) - 1
+        if 0 <= idx < len(src_texts):
+            if _signature(sub) not in norm_sources[idx]:
+                flags.append(f"MISCITED: S{s_idx} does not contain '{sub.strip()}'")
+
+    cfr_re = _gc_re.compile(r'8\s*C\.?\s*F\.?\s*R\.?[^\[\(\s]*\s*§?\s*\d+\.\d+(?:\([a-z0-9]+\))*', _gc_re.IGNORECASE)
+    ina_re = _gc_re.compile(r'INA\s*§\s*\d+\([^\)]*\)(?:\([^\)]*\))*', _gc_re.IGNORECASE)
+    all_corpus = " ".join(norm_sources)
+    for m in set(cfr_re.findall(answer) + ina_re.findall(answer)):
+        if _signature(m) not in all_corpus:
+            flags.append(f"UNGROUNDED_CITE: {m} not in any retrieved source")
+
+    n_cited = len(set(_gc_re.findall(r'\[S(\d+)', answer)))
+    if n_cited == 0 and len(src_texts) > 0:
+        flags.append("NO_INLINE_CITATIONS")
+
+    return {
+        "flags": flags,
+        "passed": len(flags) == 0,
+        "n_cited": n_cited,
+        "n_sources": len(src_texts),
+    }
+
+
 class Agent:
     """
     The main agent, now fully wired to use a live Ollama client.
@@ -513,14 +575,29 @@ You are an expert answer composer for a Retrieval-Augmented Generation (RAG) sys
 Context:
 • The ORIGINAL QUESTION from the user is shown below.
 • That question was automatically decomposed into simpler SUB-QUESTIONS.
-• Each sub-question has already been answered by an earlier step and the resulting Question→Answer pairs are provided to you in JSON.
+• Each sub-question has already been answered by an earlier step. Each sub-answer
+  ALREADY contains inline citations of the form [S1], [S2], … referring to the
+  retrieved snippets that supported it.
 
 Your task:
-1. Read every sub-answer carefully.
-2. Write a single, final answer to the ORIGINAL QUESTION **using only the information contained in the sub-answers**. Do NOT invent facts that are not present.
-3. If the original question includes a comparison (e.g., "Which, A or B, …") clearly state the outcome (e.g., "A > B"). Quote concrete numbers when available.
-4. If any aspect of the original question cannot be answered with the given sub-answers, explicitly say so (e.g., "The provided context does not mention …").
-5. Keep the answer concise (≤ 5 sentences) and use a factual, third-person tone.
+1. ACRONYM RESOLUTION: If the original question uses an uppercase acronym (CLP, CAT,
+   PSG, etc.), recognise that the sub-answers may reference the same concept by its
+   full spelled-out form (e.g. "Circumvention of Lawful Pathways"). Treat them as
+   identical. Never claim the documents "do not mention" an acronym if the sub-answers
+   discuss the spelled-out version.
+2. Read every sub-answer carefully.
+3. Write a single, final answer to the ORIGINAL QUESTION **using only the
+   information contained in the sub-answers**. Do NOT invent facts.
+4. PRESERVE INLINE CITATIONS: carry the [S#] tags from the sub-answers through to
+   your final answer, and add any regulation cites (e.g. 8 C.F.R. § 1208.33(a)(2)(ii))
+   alongside the relevant tag. Every factual claim must carry at least one [S#] tag.
+5. If the original question includes a comparison, clearly state the outcome and quote
+   concrete numbers when available.
+6. If any aspect of the original question cannot be answered with the given sub-answers
+   AFTER acronym resolution, explicitly say so and state what the documents DO cover.
+7. Do NOT append a "[Confidence: N%]" line — that is added by a separate verifier.
+8. Use a factual, third-person tone. Length should match the question; for a multi-part
+   legal question, 5-10 sentences with citations is appropriate.
 
 Input
 ------
@@ -601,18 +678,34 @@ FINAL ANSWER:
         if verification_enabled and result.get("source_documents"):
             context_str = "\n".join([doc['text'] for doc in result['source_documents']])
             verification = await self.verifier.verify_async(contextual_query, context_str, result['answer'])
-            
-            score = verification.confidence_score
 
-            # Only include confidence details if we received a non-zero score (0 usually means JSON parse failure)
-            if score > 0:
-                result['answer'] += f" [Confidence: {score}%]"
-                # Add warning only when the verifier explicitly reported low confidence / not grounded
-                if (not verification.is_grounded) or score < 50:
-                    result['answer'] += f" [Warning: Low confidence. Groundedness: {verification.is_grounded}]"
-            else:
-                # Skip appending any verifier note – 0 likely indicates a parser error
-                print("⚠️  Verifier returned 0 confidence – likely JSON parse error; omitting tags.")
+            # --- Grounded verifier footer (deterministic check + LLM verifier) ---
+            # The deterministic check is the source of truth for pass/FAIL.
+            # The LLM verifier is shown for transparency but no longer used to decide groundedness.
+            gc = hard_groundedness_check(
+                result.get('answer', ''),
+                result.get('source_documents', []) or [],
+            )
+
+            verdict = (verification.verdict or "UNKNOWN").lower()
+            grounded = "yes" if verification.is_grounded else "no"
+
+            footer_parts = [
+                f"deterministic_check={'pass' if gc['passed'] else 'FAIL'}",
+                f"cited {gc['n_cited']}/{gc['n_sources']} retrieved snippets",
+                f"verifier(llm)={verdict}",
+                f"grounded(llm)={grounded}",
+            ]
+            if verification.confidence_score and verification.confidence_score > 0:
+                footer_parts.append(f"verifier_score={verification.confidence_score}%")
+            footer = " [" + " | ".join(footer_parts) + "]"
+
+            if not gc['passed']:
+                footer += "\n  ⚠️ deterministic flags: " + "; ".join(gc['flags'])
+            elif (not verification.is_grounded) or verdict == "not_supported":
+                footer += " ⚠️ LLM_VERIFIER_FLAGGED"
+
+            result['answer'] += footer
         else:
             print("🚀 Skipping verification for speed or lack of sources")
         

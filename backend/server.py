@@ -883,26 +883,47 @@ Respond with exactly one word: USE_RAG or DIRECT_LLM"""
             batch_size_enrich = 25
             overview_model = None
             
+            def _opt(opts, *aliases, default=None, cast=lambda x: x):
+                for k in aliases:
+                    if k in opts:
+                        return cast(opts[k])
+                return default
+
             if 'Content-Length' in self.headers and int(self.headers['Content-Length']) > 0:
                 try:
                     length = int(self.headers['Content-Length'])
                     body = self.rfile.read(length)
                     opts = json.loads(body.decode('utf-8'))
-                    latechunk = bool(opts.get('latechunk', False))
-                    docling_chunk = bool(opts.get('doclingChunk', False))
-                    chunk_size = int(opts.get('chunkSize', 512))
-                    chunk_overlap = int(opts.get('chunkOverlap', 64))
-                    retrieval_mode = str(opts.get('retrievalMode', 'hybrid'))
-                    window_size = int(opts.get('windowSize', 2))
-                    enable_enrich = bool(opts.get('enableEnrich', True))
-                    embedding_model = opts.get('embeddingModel')
-                    enrich_model = opts.get('enrichModel')
-                    batch_size_embed = int(opts.get('batchSizeEmbed', 50))
-                    batch_size_enrich = int(opts.get('batchSizeEnrich', 25))
-                    overview_model = opts.get('overviewModel')
-                except Exception:
-                    # Keep defaults on parse error
-                    pass
+                except Exception as e:
+                    print(f"⚠️  build options parse error: {e}; using defaults")
+                    opts = {}
+
+                latechunk         = _opt(opts, 'latechunk', 'enable_latechunk', 'enableLatechunk', default=False, cast=bool)
+                docling_chunk     = _opt(opts, 'doclingChunk', 'docling_chunk', 'enable_docling_chunk', default=False, cast=bool)
+                chunk_size        = _opt(opts, 'chunkSize', 'chunk_size', default=512, cast=int)
+                chunk_overlap     = _opt(opts, 'chunkOverlap', 'chunk_overlap', default=64, cast=int)
+                retrieval_mode    = _opt(opts, 'retrievalMode', 'retrieval_mode', default='hybrid', cast=str)
+                window_size       = _opt(opts, 'windowSize', 'window_size', default=2, cast=int)
+                enable_enrich     = _opt(opts, 'enableEnrich', 'enable_enrich', default=True, cast=bool)
+                embedding_model   = _opt(opts, 'embeddingModel', 'embedding_model')
+                enrich_model      = _opt(opts, 'enrichModel', 'enrich_model')
+                batch_size_embed  = _opt(opts, 'batchSizeEmbed', 'batch_size_embed', default=50, cast=int)
+                batch_size_enrich = _opt(opts, 'batchSizeEnrich', 'batch_size_enrich', default=25, cast=int)
+                overview_model    = _opt(opts, 'overviewModel', 'overview_model')
+
+                known_keys = {
+                    'latechunk', 'enable_latechunk', 'enableLatechunk',
+                    'doclingChunk', 'docling_chunk', 'enable_docling_chunk',
+                    'chunkSize', 'chunk_size', 'chunkOverlap', 'chunk_overlap',
+                    'retrievalMode', 'retrieval_mode', 'windowSize', 'window_size',
+                    'enableEnrich', 'enable_enrich', 'embeddingModel', 'embedding_model',
+                    'enrichModel', 'enrich_model', 'batchSizeEmbed', 'batch_size_embed',
+                    'batchSizeEnrich', 'batch_size_enrich', 'overviewModel', 'overview_model',
+                    'config_mode',
+                }
+                unknown = set(opts) - known_keys
+                if unknown:
+                    print(f"⚠️  build received unknown options (ignored): {sorted(unknown)}")
 
             # Set per-index overview file path
             overview_path = f"index_store/overviews/{index_id}.jsonl"
@@ -1081,7 +1102,7 @@ Respond with exactly one word: USE_RAG or DIRECT_LLM"""
 
 def main():
     """Main function to initialize and start the server"""
-    PORT = 8000  # 🆕 Define port
+    PORT = int(os.environ.get("BACKEND_PORT", "8002"))  # patched: 8000 in use by external rag_api
     try:
         # Initialize the database
         print("✅ Database initialized successfully")

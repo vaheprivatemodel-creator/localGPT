@@ -142,7 +142,7 @@ class ServiceManager:
             'backend': ServiceConfig(
                 name='backend',
                 command=[sys.executable, 'backend/server.py'],
-                port=8000,
+                port=8002,
                 startup_delay=2,
                 required=True
             ),
