@@ -709,16 +709,38 @@ FINAL ANSWER:
                         flags=gc['flags'],
                     )
                     if revised and revised.strip():
-                        # Re-run deterministic check on the revised answer; only adopt
-                        # if it didn't make things worse.
+                        # Re-run deterministic check on the revised answer.
+                        # Adoption criterion: the retry must (a) reduce or zero
+                        # the flag count AND (b) not collapse the citation
+                        # footprint to a hedge. Without the cite-retention
+                        # check, a retry that drops to zero cites trivially
+                        # passes the deterministic check (no cites = no
+                        # UNGROUNDED_CITE flags), so a hedge always "wins" —
+                        # this is exactly the v5-d failure mode.
                         gc_retry = hard_groundedness_check(revised, result.get('source_documents', []) or [])
-                        if len(gc_retry['flags']) < len(gc['flags']) or gc_retry['passed']:
-                            print(f"🔁 retry improved: flags {len(gc['flags'])} -> {len(gc_retry['flags'])}")
+                        flag_reduction = (
+                            len(gc_retry['flags']) < len(gc['flags']) or gc_retry['passed']
+                        )
+                        if gc['n_cited'] > 0:
+                            cite_retention = gc_retry['n_cited'] >= max(gc['n_cited'] - 1, 1)
+                        else:
+                            cite_retention = True
+                        if flag_reduction and cite_retention:
+                            print(
+                                f"🔁 retry improved: flags {len(gc['flags'])} -> {len(gc_retry['flags'])}, "
+                                f"cites {gc['n_cited']} -> {gc_retry['n_cited']}"
+                            )
                             result['answer'] = revised
                             gc = gc_retry
                             retry_meta["improved"] = True
                         else:
-                            print(f"🔁 retry did not improve (flags {len(gc['flags'])} -> {len(gc_retry['flags'])}); keeping original")
+                            reason = (
+                                "fewer-cites-collapsed" if not cite_retention else "no-flag-reduction"
+                            )
+                            print(
+                                f"🔁 retry rejected ({reason}): flags {len(gc['flags'])}->{len(gc_retry['flags'])}, "
+                                f"cites {gc['n_cited']}->{gc_retry['n_cited']}"
+                            )
                 except Exception as e:
                     print(f"⚠️ retry synthesis failed: {e}")
                 retry_meta["latency"] = time.time() - retry_t0

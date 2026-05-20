@@ -1,3 +1,4 @@
+import os
 import requests
 import json
 from typing import List, Dict, Any
@@ -5,6 +6,29 @@ import base64
 from io import BytesIO
 from PIL import Image
 import httpx, asyncio
+
+
+def _default_options() -> Dict[str, Any]:
+    """Default Ollama generation options.
+
+    Ollama's API default is `temperature=0.8` with no seed, which produced
+    ~20-30 absolute composite-point swings between same-code, same-query runs
+    in the v5 attempted experiments. Setting a low non-zero temperature and a
+    fixed seed makes single-run scoring meaningful again without collapsing
+    to the v5-d failure mode (greedy decoding + safety-encouraging retry
+    prompt = the model always picks "I cannot answer").
+
+    Both knobs are env-overridable so callers can experiment without code
+    changes:
+
+      * ``OLLAMA_TEMPERATURE`` (default 0.3) — generation temperature.
+      * ``OLLAMA_SEED`` (default 42) — RNG seed for reproducibility.
+    """
+    return {
+        "temperature": float(os.environ.get("OLLAMA_TEMPERATURE", "0.3")),
+        "seed": int(os.environ.get("OLLAMA_SEED", "42")),
+    }
+
 
 class OllamaClient:
     """
@@ -41,6 +65,7 @@ class OllamaClient:
         format: str = "",
         images: List[Image.Image] | None = None,
         enable_thinking: bool | None = None,
+        options: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """
         Generates a completion, now with optional support for images.
@@ -51,20 +76,23 @@ class OllamaClient:
             format: The format for the response, e.g., "json".
             images: A list of Pillow Image objects to send to the VLM.
             enable_thinking: Optional flag to disable chain-of-thought for Qwen models.
+            options: Optional Ollama ``options`` overrides. Caller-supplied keys
+                override the defaults from :func:`_default_options`.
         """
         try:
+            merged_options = {**_default_options(), **(options or {})}
             payload = {
                 "model": model,
                 "prompt": prompt,
-                "stream": False
+                "stream": False,
+                "options": merged_options,
             }
             if format:
                 payload["format"] = format
-            
+
             if images:
                 payload["images"] = [self._image_to_base64(img) for img in images]
 
-            # Optional: disable thinking mode for Qwen3 / DeepSeek models
             if enable_thinking is not None:
                 payload["chat_template_kwargs"] = {"enable_thinking": enable_thinking}
 
@@ -94,10 +122,17 @@ class OllamaClient:
         images: List[Image.Image] | None = None,
         enable_thinking: bool | None = None,
         timeout: int = 60,
+        options: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Asynchronous version of generate_completion using httpx."""
 
-        payload = {"model": model, "prompt": prompt, "stream": False}
+        merged_options = {**_default_options(), **(options or {})}
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": merged_options,
+        }
         if format:
             payload["format"] = format
         if images:
@@ -125,6 +160,7 @@ class OllamaClient:
         *,
         images: List[Image.Image] | None = None,
         enable_thinking: bool | None = None,
+        options: Dict[str, Any] | None = None,
     ):
         """Generator that yields partial *response* strings as they arrive.
 
@@ -133,7 +169,13 @@ class OllamaClient:
             for tok in client.stream_completion("qwen2", "Hello"):
                 print(tok, end="", flush=True)
         """
-        payload: Dict[str, Any] = {"model": model, "prompt": prompt, "stream": True}
+        merged_options = {**_default_options(), **(options or {})}
+        payload: Dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "stream": True,
+            "options": merged_options,
+        }
         if images:
             payload["images"] = [self._image_to_base64(img) for img in images]
         if enable_thinking is not None:
