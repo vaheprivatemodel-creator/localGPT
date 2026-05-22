@@ -1,7 +1,7 @@
 "use client";
 
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
-import { useRouter, usePathname } from "next/navigation";
+import { usePathname } from "next/navigation";
 
 export interface AuthUser {
   id: string;
@@ -26,7 +26,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [token, setToken] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const router = useRouter();
   const pathname = usePathname();
 
   // Rehydrate from localStorage on mount
@@ -45,20 +44,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setIsLoading(false);
   }, []);
 
-  // Redirect unauthenticated users away from protected pages
+  // Guard protected pages on initial load (after localStorage rehydration)
   useEffect(() => {
     if (isLoading) return;
     const isPublic = PUBLIC_PATHS.some((p) => pathname?.startsWith(p));
     if (!token && !isPublic) {
-      router.replace("/login");
+      window.location.href = "/login";
     }
-    if (token && pathname === "/login") {
-      router.replace("/");
-    }
-  }, [token, isLoading, pathname, router]);
+  }, [token, isLoading, pathname]);
 
   const login = useCallback(async (email: string, password: string) => {
-    const res = await fetch("http://localhost:8002/auth/login", {
+    const res = await fetch("/api/auth/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, password }),
@@ -70,25 +66,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const data = await res.json();
     localStorage.setItem("auth_token", data.token);
     localStorage.setItem("auth_user", JSON.stringify(data.user));
-    setToken(data.token);
-    setUser(data.user);
-    router.replace("/");
-  }, [router]);
+    // Hard redirect — guarantees the token is picked up on the new page
+    window.location.href = "/";
+  }, []);
 
   const logout = useCallback(() => {
     const t = localStorage.getItem("auth_token");
     if (t) {
-      fetch("http://localhost:8002/auth/logout", {
+      fetch("/api/auth/logout", {
         method: "POST",
         headers: { Authorization: `Bearer ${t}` },
       }).catch(() => {});
     }
     localStorage.removeItem("auth_token");
     localStorage.removeItem("auth_user");
-    setToken(null);
-    setUser(null);
-    router.replace("/login");
-  }, [router]);
+    window.location.href = "/login";
+  }, []);
 
   return (
     <AuthContext.Provider value={{ user, token, isLoading, login, logout }}>

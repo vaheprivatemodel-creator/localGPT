@@ -1,4 +1,4 @@
-const API_BASE_URL = 'http://localhost:8002';
+const API_BASE_URL = '/api';
 
 // Auth token helper — reads from localStorage on every call so it's always current
 function authHeaders(): Record<string, string> {
@@ -586,7 +586,7 @@ class ChatAPI {
     if (typeof forceRag === 'boolean') payload.force_rag = forceRag;
     if (typeof provencePrune === 'boolean') payload.provence_prune = provencePrune;
 
-    const resp = await fetch('http://localhost:8001/chat/stream', {
+    const resp = await fetch('/api/stream', {
       method: 'POST',
       headers: { ...authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
