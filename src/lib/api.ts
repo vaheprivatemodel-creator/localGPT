@@ -1,5 +1,12 @@
 const API_BASE_URL = 'http://localhost:8002';
 
+// Auth token helper — reads from localStorage on every call so it's always current
+function authHeaders(): Record<string, string> {
+  if (typeof window === 'undefined') return {};
+  const token = localStorage.getItem('auth_token');
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 // 🆕 Simple UUID generator for client-side message IDs
 export const generateUUID = () => {
   if (typeof window !== 'undefined' && window.crypto && window.crypto.randomUUID) {
@@ -99,9 +106,7 @@ class ChatAPI {
     try {
       const response = await fetch(`${API_BASE_URL}/chat`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: request.message,
           model: request.model || 'llama3.2:latest',
@@ -134,7 +139,9 @@ class ChatAPI {
   // Session Management
   async getSessions(): Promise<SessionResponse> {
     try {
-      const response = await fetch(`${API_BASE_URL}/sessions`);
+      const response = await fetch(`${API_BASE_URL}/sessions`, {
+        headers: authHeaders(),
+      });
       if (!response.ok) {
         throw new Error(`Failed to get sessions: ${response.status}`);
       }
@@ -149,9 +156,7 @@ class ChatAPI {
     try {
       const response = await fetch(`${API_BASE_URL}/sessions`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ title, model }),
       });
 
@@ -169,7 +174,9 @@ class ChatAPI {
 
   async getSession(sessionId: string): Promise<{ session: ChatSession; messages: ChatMessage[] }> {
     try {
-      const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}`);
+      const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}`, {
+        headers: authHeaders(),
+      });
       if (!response.ok) {
         throw new Error(`Failed to get session: ${response.status}`);
       }
@@ -203,9 +210,7 @@ class ChatAPI {
     try {
       const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/messages`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message,
           ...(opts.model && { model: opts.model }),
@@ -259,9 +264,7 @@ class ChatAPI {
     try {
       const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/rename`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ title: newTitle }),
       });
 
@@ -323,9 +326,7 @@ class ChatAPI {
     try {
       const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/index`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
       });
 
       if (!response.ok) {
@@ -440,7 +441,7 @@ class ChatAPI {
   async createIndex(name: string, description?: string, metadata: Record<string, unknown> = {}): Promise<{ index_id: string }> {
     const resp = await fetch(`${API_BASE_URL}/indexes`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, description, metadata }),
     });
     if (!resp.ok) {
@@ -478,9 +479,7 @@ class ChatAPI {
     try {
       const response = await fetch(`${API_BASE_URL}/indexes/${indexId}/build`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
           latechunk: opts.latechunk ?? false,
           doclingChunk: opts.doclingChunk ?? false,
@@ -519,7 +518,7 @@ class ChatAPI {
   }
 
   async listIndexes(): Promise<{ indexes: any[]; total: number }> {
-    const resp = await fetch(`${API_BASE_URL}/indexes`);
+    const resp = await fetch(`${API_BASE_URL}/indexes`, { headers: authHeaders() });
     if (!resp.ok) {
       throw new Error(`Failed to list indexes: ${resp.status}`);
     }
@@ -527,7 +526,7 @@ class ChatAPI {
   }
 
   async getSessionIndexes(sessionId: string): Promise<{ indexes: any[]; total: number }> {
-    const resp = await fetch(`${API_BASE_URL}/sessions/${sessionId}/indexes`);
+    const resp = await fetch(`${API_BASE_URL}/sessions/${sessionId}/indexes`, { headers: authHeaders() });
     if (!resp.ok) throw new Error(`Failed to get session indexes: ${resp.status}`);
     return resp.json();
   }
@@ -535,6 +534,7 @@ class ChatAPI {
   async deleteIndex(indexId: string): Promise<{ message: string }> {
     const resp = await fetch(`${API_BASE_URL}/indexes/${indexId}`, {
       method: 'DELETE',
+      headers: authHeaders(),
     });
     if (!resp.ok) {
       const data = await resp.json().catch(() => ({ error: 'Unknown error'}));
@@ -588,7 +588,7 @@ class ChatAPI {
 
     const resp = await fetch('http://localhost:8001/chat/stream', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
 
@@ -627,6 +627,111 @@ class ChatAPI {
         }
       }
     }
+  }
+}
+
+  // ─────────────────────── Audit log ───────────────────────
+
+  async getAuditLog(opts: {
+    limit?: number;
+    offset?: number;
+    reviewed?: boolean | null;
+    dateFrom?: string;
+    dateTo?: string;
+    sessionId?: string;
+  } = {}): Promise<{ entries: AuditEntry[]; total: number; limit: number; offset: number }> {
+    const params = new URLSearchParams();
+    if (opts.limit != null) params.set('limit', String(opts.limit));
+    if (opts.offset != null) params.set('offset', String(opts.offset));
+    if (opts.reviewed === true)  params.set('reviewed', 'true');
+    if (opts.reviewed === false) params.set('reviewed', 'false');
+    if (opts.dateFrom) params.set('date_from', opts.dateFrom);
+    if (opts.dateTo)   params.set('date_to', opts.dateTo);
+    if (opts.sessionId) params.set('session_id', opts.sessionId);
+    const resp = await fetch(`${API_BASE_URL}/audit?${params}`, { headers: authHeaders() });
+    if (!resp.ok) throw new Error(`Audit log fetch failed: ${resp.status}`);
+    return resp.json();
+  }
+
+  async markReviewed(auditId: string, reviewedBy = 'Attorney'): Promise<{ message: string }> {
+    const resp = await fetch(`${API_BASE_URL}/audit/${auditId}/review`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reviewed_by: reviewedBy }),
+    });
+    if (!resp.ok) throw new Error(`Mark reviewed failed: ${resp.status}`);
+    return resp.json();
+  }
+
+  async logAuditEntry(data: {
+    session_id: string;
+    user_query: string;
+    ai_response: string;
+    source_documents?: unknown[];
+    used_rag?: boolean;
+    message_id?: string;
+  }): Promise<{ audit_entry_id: string }> {
+    const resp = await fetch(`${API_BASE_URL}/audit/log`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!resp.ok) throw new Error(`Audit log entry failed: ${resp.status}`);
+    return resp.json();
+  }
+
+  getAuditExportUrl(): string {
+    const token = typeof window !== 'undefined' ? localStorage.getItem('auth_token') : null;
+    return token
+      ? `${API_BASE_URL}/audit/export?token=${token}`
+      : `${API_BASE_URL}/audit/export`;
+  }
+}
+
+export interface AuditEntry {
+  id: string;
+  session_id: string;
+  message_id: string | null;
+  user_query: string;
+  ai_response: string;
+  source_documents: unknown[];
+  kb_gap_flagged: number;
+  used_rag: number;
+  created_at: string;
+  reviewed_at: string | null;
+  reviewed_by: string | null;
+  // -------------------- Admin user management --------------------
+
+  async listUsers(): Promise<{ users: any[]; total: number }> {
+    const resp = await fetch(`${API_BASE_URL}/admin/users`, { headers: authHeaders() });
+    if (!resp.ok) throw new Error(`Failed to list users: ${resp.status}`);
+    return resp.json();
+  }
+
+  async createUser(data: { email: string; name: string; role: string; password: string }): Promise<{ message: string; user_id: string }> {
+    const resp = await fetch(`${API_BASE_URL}/admin/users`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || `Failed to create user: ${resp.status}`);
+    }
+    return resp.json();
+  }
+
+  async updateUser(userId: string, data: { name?: string; role?: string; is_active?: boolean; password?: string }): Promise<{ message: string }> {
+    const resp = await fetch(`${API_BASE_URL}/admin/users/${userId}`, {
+      method: 'POST',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || `Failed to update user: ${resp.status}`);
+    }
+    return resp.json();
   }
 }
 

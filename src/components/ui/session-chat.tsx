@@ -66,6 +66,8 @@ export const SessionChat = forwardRef<SessionChatRef, SessionChatProps>(({
   const [showSettings, setShowSettings] = useState(false)
   const [showIndexForm, setShowIndexForm] = useState(false)
   const [showIndexInfo, setShowIndexInfo] = useState(false)
+  /** Map from message.id → audit_entry_id for the "Mark Reviewed" button */
+  const [auditEntryIds, setAuditEntryIds] = useState<Record<string, string>>({})
   
   const apiService = chatAPI
 
@@ -409,7 +411,6 @@ export const SessionChat = forwardRef<SessionChatRef, SessionChatProps>(({
                 steps[finalIdx].status = 'done';
 
                 if (steps[finalIdx].key === 'direct') {
-                  // Direct answer: details is plain string
                   steps[finalIdx].details = evt.data.answer;
                 } else {
                   steps[finalIdx].details = {
@@ -419,25 +420,34 @@ export const SessionChat = forwardRef<SessionChatRef, SessionChatProps>(({
                 }
 
                 setIsLoading(false);
-                // Make sure any lingering steps are marked done
-                steps.forEach(s => {
-                  if (s.status !== 'done') s.status = 'done';
-                });
-                
-                // 🔄 REFRESH SESSION: After completion, refresh session data to get updated title
+                steps.forEach(s => { if (s.status !== 'done') s.status = 'done'; });
+
+                // ── Audit log for streaming path ────────────────────────────
+                if (activeSessionId && evt.data.answer) {
+                  apiService.logAuditEntry({
+                    session_id: activeSessionId as string,
+                    user_query: content,
+                    ai_response: evt.data.answer,
+                    source_documents: evt.data.source_documents || [],
+                    used_rag: true,
+                    message_id: m.id,
+                  }).then(res => {
+                    setAuditEntryIds(prev => ({ ...prev, [m.id]: res.audit_entry_id }));
+                  }).catch(() => {/* non-critical */});
+                }
+                // ───────────────────────────────────────────────────────────
+
+                // 🔄 REFRESH SESSION
                 if (activeSessionId) {
-                  // Always refresh session data so updated title & message count are reflected in the UI
                   setTimeout(async () => {
                     try {
                       const { session } = await apiService.getSession(activeSessionId as string);
                       setCurrentSession(session);
-                      if (onSessionChange) {
-                        onSessionChange(session);
-                      }
+                      if (onSessionChange) onSessionChange(session);
                     } catch (error) {
                       console.error('Failed to refresh session after completion:', error);
                     }
-                  }, 100); // Small delay to ensure backend has processed the title update
+                  }, 100);
                 }
                 
                 return { ...m, content: { steps }, metadata: { message_type: 'complete' } };
@@ -469,8 +479,10 @@ export const SessionChat = forwardRef<SessionChatRef, SessionChatProps>(({
           provencePrune,
         })
       
+      const msgId = (response as any).ai_message_id || generateUUID()
+      const auditId = (response as any).audit_entry_id as string | undefined
       const aiMessage: ChatMessage = {
-        id: response.ai_message_id || generateUUID(),
+        id: msgId,
         content: response.response,
         sender: 'assistant',
         timestamp: new Date().toISOString(),
@@ -480,6 +492,9 @@ export const SessionChat = forwardRef<SessionChatRef, SessionChatProps>(({
           }
       }
       setMessages(prev => [...prev, aiMessage])
+      if (auditId) {
+        setAuditEntryIds(prev => ({ ...prev, [msgId]: auditId }))
+      }
       
         if ((response as any).session) {
           const sess = (response as any).session as ChatSession
@@ -597,6 +612,7 @@ export const SessionChat = forwardRef<SessionChatRef, SessionChatProps>(({
             messages={messages}
             isLoading={isLoading}
             onAction={handleAction}
+            auditEntryIds={auditEntryIds}
             className="flex-1 overflow-y-auto"
           />
 

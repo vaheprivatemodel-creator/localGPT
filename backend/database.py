@@ -1,9 +1,27 @@
 import sqlite3
 import uuid
 import json
-from datetime import datetime
+import hashlib
+import secrets
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from pathlib import Path
+
+# ──────────────────────────────────────────────────────────
+# Password hashing helpers (stdlib only, no extra deps)
+# ──────────────────────────────────────────────────────────
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000)
+    return f"{salt}${dk.hex()}"
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, dk_hex = stored.split("$", 1)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000)
+        return secrets.compare_digest(dk.hex(), dk_hex)
+    except Exception:
+        return False
 
 class ChatDatabase:
     def __init__(self, db_path: str = None):
@@ -106,20 +124,185 @@ class ChatDatabase:
             )
         ''')
         
+        # Audit log table — append-only record of every AI interaction
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id TEXT PRIMARY KEY,
+                session_id TEXT,
+                message_id TEXT,
+                user_query TEXT NOT NULL,
+                ai_response TEXT NOT NULL,
+                source_documents TEXT DEFAULT '[]',
+                kb_gap_flagged INTEGER DEFAULT 0,
+                used_rag INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT,
+                reviewed_by TEXT,
+                FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE SET NULL
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_log(session_id)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at)')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_audit_reviewed ON audit_log(reviewed_at)')
+
+        # ── Auth: users ──────────────────────────────────────────
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'attorney',
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                is_active INTEGER NOT NULL DEFAULT 1
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)')
+
+        # ── Auth: login tokens (30-day sessions) ─────────────────
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS auth_tokens (
+                token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        ''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_auth_tokens_user_id ON auth_tokens(user_id)')
+
+        # ── Migration: add user_id to sessions if missing ────────
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+        if 'user_id' not in cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN user_id TEXT")
+
         conn.commit()
         conn.close()
+
+        # Seed default admin and assign any orphan sessions to them
+        self._seed_admin()
         print("✅ Database initialized successfully")
-    
-    def create_session(self, title: str, model: str) -> str:
+
+    # ─────────────────────────────────────────────
+    # Audit log helpers
+    # ─────────────────────────────────────────────
+
+    def log_interaction(
+        self,
+        session_id: str,
+        user_query: str,
+        ai_response: str,
+        source_documents: list = None,
+        kb_gap_flagged: bool = False,
+        used_rag: bool = False,
+        message_id: str = None,
+    ) -> str:
+        """Append-only: record an AI interaction. Returns the new audit entry id."""
+        entry_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        src_json = json.dumps(source_documents or [])
+        has_gap = 1 if kb_gap_flagged else 0
+        is_rag = 1 if used_rag else 0
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            '''INSERT INTO audit_log
+               (id, session_id, message_id, user_query, ai_response,
+                source_documents, kb_gap_flagged, used_rag, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?)''',
+            (entry_id, session_id, message_id, user_query, ai_response,
+             src_json, has_gap, is_rag, now)
+        )
+        conn.commit()
+        conn.close()
+        return entry_id
+
+    def mark_reviewed(self, audit_id: str, reviewed_by: str = "Attorney") -> bool:
+        """Mark an audit entry as human-reviewed. Returns True if found."""
+        now = datetime.now().isoformat()
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.execute(
+            'UPDATE audit_log SET reviewed_at=?, reviewed_by=? WHERE id=?',
+            (now, reviewed_by, audit_id)
+        )
+        affected = cur.rowcount
+        conn.commit()
+        conn.close()
+        return affected > 0
+
+    def get_audit_log(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        reviewed: Optional[bool] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Tuple[List[Dict], int]:
+        """Return (rows, total_count) with optional filters."""
+        clauses, params = [], []
+        if reviewed is True:
+            clauses.append('reviewed_at IS NOT NULL')
+        elif reviewed is False:
+            clauses.append('reviewed_at IS NULL')
+        if date_from:
+            clauses.append('created_at >= ?')
+            params.append(date_from)
+        if date_to:
+            clauses.append('created_at <= ?')
+            params.append(date_to)
+        if session_id:
+            clauses.append('session_id = ?')
+            params.append(session_id)
+        where = ('WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        total = conn.execute(f'SELECT COUNT(*) FROM audit_log {where}', params).fetchone()[0]
+        rows = conn.execute(
+            f'SELECT * FROM audit_log {where} ORDER BY created_at DESC LIMIT ? OFFSET ?',
+            params + [limit, offset]
+        ).fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d['source_documents'] = json.loads(d.get('source_documents') or '[]')
+            except Exception:
+                d['source_documents'] = []
+            result.append(d)
+        return result, total
+
+    def get_audit_entry(self, audit_id: str) -> Optional[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute('SELECT * FROM audit_log WHERE id=?', (audit_id,)).fetchone()
+        conn.close()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d['source_documents'] = json.loads(d.get('source_documents') or '[]')
+        except Exception:
+            d['source_documents'] = []
+        return d
+
+    def create_session(self, title: str, model: str, user_id: str = None) -> str:
         """Create a new chat session"""
         session_id = str(uuid.uuid4())
         now = datetime.now().isoformat()
         
         conn = sqlite3.connect(self.db_path)
-        conn.execute('''
-            INSERT INTO sessions (id, title, created_at, updated_at, model_used)
-            VALUES (?, ?, ?, ?, ?)
-        ''', (session_id, title, now, now, model))
+        # Insert with user_id if the column exists; ignore if not (forward-compat)
+        try:
+            conn.execute('''
+                INSERT INTO sessions (id, title, created_at, updated_at, model_used, user_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (session_id, title, now, now, model, user_id))
+        except Exception:
+            conn.execute('''
+                INSERT INTO sessions (id, title, created_at, updated_at, model_used)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (session_id, title, now, now, model))
         conn.commit()
         conn.close()
         
@@ -640,6 +823,136 @@ class ChatDatabase:
         except Exception as e:
             print(f"⚠️ Failed to inspect index metadata for {index_id[:8]}...: {e}")
             return {}
+
+    # ─────────────────────────────────────────────────────────────
+    # User & auth helpers
+    # ─────────────────────────────────────────────────────────────
+
+    def _seed_admin(self):
+        """Create the default admin account on first start. Assign orphan sessions to it."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        existing = conn.execute("SELECT id FROM users LIMIT 1").fetchone()
+        if existing:
+            conn.close()
+            return
+        admin_id = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        conn.execute(
+            "INSERT INTO users (id,email,name,role,password_hash,created_at) VALUES (?,?,?,?,?,?)",
+            (admin_id, "admin@firm.com", "Admin", "admin", hash_password("changeme123"), now),
+        )
+        conn.execute("UPDATE sessions SET user_id=? WHERE user_id IS NULL", (admin_id,))
+        conn.commit()
+        conn.close()
+        print("🔑 Default admin seeded: admin@firm.com / changeme123")
+
+    def create_user(self, email: str, name: str, role: str, password: str) -> str:
+        uid = str(uuid.uuid4())
+        now = datetime.now().isoformat()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO users (id,email,name,role,password_hash,created_at) VALUES (?,?,?,?,?,?)",
+            (uid, email.lower().strip(), name.strip(), role, hash_password(password), now),
+        )
+        conn.commit()
+        conn.close()
+        return uid
+
+    def get_user_by_email(self, email: str) -> Optional[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM users WHERE email=?", (email.lower().strip(),)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def get_user_by_id(self, uid: str) -> Optional[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def list_users(self) -> List[Dict]:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT id,email,name,role,created_at,is_active FROM users ORDER BY created_at").fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
+    def update_user(self, uid: str, updates: Dict) -> bool:
+        allowed = {"name", "role", "is_active", "password_hash"}
+        fields = {k: v for k, v in updates.items() if k in allowed}
+        if not fields:
+            return False
+        set_clause = ", ".join(f"{k}=?" for k in fields)
+        values = list(fields.values()) + [uid]
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.execute(f"UPDATE users SET {set_clause} WHERE id=?", values)
+        affected = cur.rowcount
+        conn.commit()
+        conn.close()
+        return affected > 0
+
+    def create_auth_token(self, user_id: str, days: int = 30) -> str:
+        token = secrets.token_urlsafe(32)
+        now = datetime.now()
+        conn = sqlite3.connect(self.db_path)
+        conn.execute(
+            "INSERT INTO auth_tokens (token, user_id, created_at, expires_at) VALUES (?,?,?,?)",
+            (token, user_id, now.isoformat(), (now + timedelta(days=days)).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+        return token
+
+    def get_user_by_token(self, token: str) -> Optional[Dict]:
+        """Return user dict if token is valid and not expired, else None."""
+        now = datetime.now().isoformat()
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """SELECT u.* FROM users u
+               JOIN auth_tokens t ON t.user_id=u.id
+               WHERE t.token=? AND t.expires_at>? AND u.is_active=1""",
+            (token, now),
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def revoke_token(self, token: str):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM auth_tokens WHERE token=?", (token,))
+        conn.commit()
+        conn.close()
+
+    def revoke_all_tokens_for_user(self, user_id: str):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("DELETE FROM auth_tokens WHERE user_id=?", (user_id,))
+        conn.commit()
+        conn.close()
+
+    # ─────────────────────────────────────────────────────────────
+    # Overrides for session ownership
+    # ─────────────────────────────────────────────────────────────
+
+    def get_sessions_for_user(self, user_id: str, role: str, limit: int = 50) -> List[Dict]:
+        """Admins see all sessions; others see only their own."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        if role == "admin":
+            rows = conn.execute(
+                "SELECT id,title,created_at,updated_at,model_used,message_count FROM sessions ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id,title,created_at,updated_at,model_used,message_count FROM sessions WHERE user_id=? ORDER BY updated_at DESC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
 
 def generate_session_title(first_message: str, max_length: int = 50) -> str:
     """Generate a session title from the first message"""

@@ -10,8 +10,12 @@ import { IndexForm } from "@/components/IndexForm";
 import SessionIndexInfo from "@/components/SessionIndexInfo";
 import IndexPicker from "@/components/IndexPicker";
 import { QuickChat } from '@/components/ui/quick-chat'
+import { useAuth } from "@/context/AuthContext"
+import Link from "next/link"
+import { ShieldCheck } from "lucide-react"
 
 export function Demo() {
+    const { user, logout } = useAuth()
     const [currentSessionId, setCurrentSessionId] = useState<string | undefined>()
     const [currentSession, setCurrentSession] = useState<ChatSession | null>(null)
     const [showConversation, setShowConversation] = useState(false)
@@ -95,6 +99,18 @@ export function Demo() {
                 {homeMode !== 'HOME' && (
                     <h1 className="text-lg font-semibold text-white">localGPT</h1>
                 )}
+                <div className="absolute right-4 flex items-center gap-1">
+                    <Link href="/audit" className="flex items-center gap-1.5 text-sm text-gray-400 hover:text-green-300 transition-colors px-2 py-1 rounded hover:bg-gray-800" title="Audit Log">
+                        <ShieldCheck className="w-4 h-4" />
+                        <span className="hidden sm:inline">Audit</span>
+                    </Link>
+                    {user?.role === 'admin' && (
+                        <Link href="/admin/users" className="text-xs text-gray-400 hover:text-white transition px-2 py-1 rounded hover:bg-gray-800">Users</Link>
+                    )}
+                    <span className="text-xs text-gray-500 px-1 hidden md:block">|</span>
+                    <span className="text-xs text-gray-400 hidden md:block">{user?.name}</span>
+                    <button onClick={logout} className="text-xs text-gray-400 hover:text-white transition px-2 py-1 rounded hover:bg-gray-800">Sign out</button>
+                </div>
             </header>
             {/* Main content row */}
             <div className="flex flex-1 flex-row min-h-0">

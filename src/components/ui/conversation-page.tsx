@@ -1,13 +1,13 @@
 "use client"
 
 import * as React from "react"
-import { useRef, useEffect, useState } from "react"
+import { useRef, useEffect, useState, useCallback } from "react"
 import {
   ChatBubbleAvatar,
 } from "@/components/ui/chat-bubble"
-import { Copy, RefreshCcw, ThumbsUp, ThumbsDown, Volume2, MoreHorizontal, ChevronDown, Loader2, CheckCircle, XOctagon } from "lucide-react"
+import { Copy, RefreshCcw, ThumbsUp, ThumbsDown, Volume2, MoreHorizontal, ChevronDown, Loader2, CheckCircle, XOctagon, ShieldCheck } from "lucide-react"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { ChatMessage } from "@/lib/api"
+import { ChatMessage, chatAPI } from "@/lib/api"
 import { cn } from "@/lib/utils"
 import Markdown from "@/components/Markdown"
 import { normalizeWhitespace } from "@/utils/textNormalization"
@@ -17,15 +17,13 @@ interface ConversationPageProps {
   isLoading?: boolean
   className?: string
   onAction?: (action: string, messageId: string, messageContent: string) => void
+  /** Map of message.id → audit_entry_id for messages that have been logged */
+  auditEntryIds?: Record<string, string>
 }
 
 const actionIcons = [
   { icon: Copy, type: "Copy", action: "copy" },
-  { icon: ThumbsUp, type: "Like", action: "like" },
-  { icon: ThumbsDown, type: "Dislike", action: "dislike" },
-  { icon: Volume2, type: "Speak", action: "speak" },
   { icon: RefreshCcw, type: "Regenerate", action: "regenerate" },
-  { icon: MoreHorizontal, type: "More", action: "more" },
 ]
 
 // Citation block toggle component
@@ -64,6 +62,41 @@ function CitationsBlock({docs}:{docs:any[]}){
         </button>
       )}
     </div>
+  );
+}
+
+function ReviewButton({ auditEntryId }: { auditEntryId: string }) {
+  const [status, setStatus] = useState<'idle' | 'loading' | 'done'>('idle');
+
+  const handleReview = useCallback(async () => {
+    if (status !== 'idle') return;
+    setStatus('loading');
+    try {
+      await chatAPI.markReviewed(auditEntryId);
+      setStatus('done');
+    } catch {
+      setStatus('idle');
+    }
+  }, [auditEntryId, status]);
+
+  if (status === 'done') {
+    return (
+      <span className="flex items-center gap-1 text-xs text-green-400 px-2 py-1">
+        <ShieldCheck className="w-3.5 h-3.5" /> Reviewed
+      </span>
+    );
+  }
+
+  return (
+    <button
+      onClick={handleReview}
+      disabled={status === 'loading'}
+      className="flex items-center gap-1 text-xs px-2 py-1 rounded hover:bg-gray-700 text-gray-400 hover:text-green-300 transition-colors disabled:opacity-50"
+      title="Mark this answer as reviewed by an attorney"
+    >
+      <ShieldCheck className="w-3.5 h-3.5" />
+      {status === 'loading' ? 'Saving…' : 'Mark Reviewed'}
+    </button>
   );
 }
 
@@ -201,7 +234,8 @@ export function ConversationPage({
   messages, 
   isLoading = false,
   className = "",
-  onAction
+  onAction,
+  auditEntryIds = {},
 }: ConversationPageProps) {
   const scrollAreaRef = useRef<HTMLDivElement>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
@@ -350,6 +384,10 @@ export function ConversationPage({
                             <Icon className="w-3.5 h-3.5" />
                           </button>
                         ))}
+                        {/* Mark Reviewed button — shown when we have an audit entry for this message */}
+                        {auditEntryIds[message.id] && (
+                          <ReviewButton auditEntryId={auditEntryIds[message.id]} />
+                        )}
                       </div>
                     )}
 

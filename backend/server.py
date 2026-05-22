@@ -23,7 +23,7 @@ except ImportError as e:
     print(f"⚠️ RAG system modules not available: {e}")
 
 from ollama_client import OllamaClient
-from database import db, generate_session_title
+from database import db, generate_session_title, verify_password, hash_password
 import simple_pdf_processor as pdf_module
 from simple_pdf_processor import initialize_simple_pdf_processor
 from typing import List, Dict, Any
@@ -42,14 +42,43 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         """Handle CORS preflight requests"""
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+        self.send_header('Access-Control-Allow-Credentials', 'true')
         self.end_headers()
+
+    # ── Auth helpers ─────────────────────────────────────────────
+
+    def _get_current_user(self):
+        """Extract Bearer token and return the user dict, or None."""
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return None
+        token = auth[7:].strip()
+        if not token:
+            return None
+        return db.get_user_by_token(token)
+
+    def _require_auth(self):
+        """Return user dict or send 401 and return None."""
+        user = self._get_current_user()
+        if not user:
+            self.send_json_response({"error": "Unauthorized – please log in"}, status_code=401)
+        return user
+
+    def _require_admin(self):
+        """Return user dict if admin, else send 403 and return None."""
+        user = self._require_auth()
+        if user and user.get("role") != "admin":
+            self.send_json_response({"error": "Forbidden – admin only"}, status_code=403)
+            return None
+        return user
     
     def do_GET(self):
         """Handle GET requests"""
         parsed_path = urlparse(self.path)
-        
+
+        # ── Public ────────────────────────────────────────────────
         if parsed_path.path == '/health':
             self.send_json_response({
                 "status": "ok",
@@ -57,14 +86,31 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                 "available_models": self.ollama_client.list_models(),
                 "database_stats": db.get_stats()
             })
-        elif parsed_path.path == '/sessions':
-            self.handle_get_sessions()
+            return
+        if parsed_path.path == '/auth/me':
+            user = self._require_auth()
+            if user:
+                self.send_json_response({
+                    "id": user["id"], "email": user["email"],
+                    "name": user["name"], "role": user["role"]
+                })
+            return
+
+        # ── All other routes require auth ─────────────────────────
+        user = self._require_auth()
+        if not user:
+            return
+
+        if parsed_path.path == '/sessions':
+            self.handle_get_sessions(user)
         elif parsed_path.path == '/sessions/cleanup':
             self.handle_cleanup_sessions()
         elif parsed_path.path == '/models':
             self.handle_get_models()
         elif parsed_path.path == '/indexes':
             self.handle_get_indexes()
+        elif parsed_path.path == '/admin/users':
+            self.handle_admin_list_users(user)
         elif parsed_path.path.startswith('/indexes/') and parsed_path.path.count('/') == 2:
             index_id = parsed_path.path.split('/')[-1]
             self.handle_get_index(index_id)
@@ -77,20 +123,45 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         elif parsed_path.path.startswith('/sessions/') and parsed_path.path.count('/') == 2:
             session_id = parsed_path.path.split('/')[-1]
             self.handle_get_session(session_id)
+        elif parsed_path.path in ('/audit', '/audit/'):
+            self.handle_get_audit_log()
+        elif parsed_path.path == '/audit/export':
+            self.handle_export_audit_log()
+        elif parsed_path.path.startswith('/audit/') and parsed_path.path.count('/') == 2:
+            audit_id = parsed_path.path.split('/')[-1]
+            self.handle_get_audit_entry(audit_id)
         else:
             self.send_response(404)
             self.end_headers()
-    
+
     def do_POST(self):
         """Handle POST requests"""
         parsed_path = urlparse(self.path)
-        
+
+        # ── Public auth endpoints ─────────────────────────────────
+        if parsed_path.path == '/auth/login':
+            self.handle_auth_login()
+            return
+        if parsed_path.path == '/auth/logout':
+            self.handle_auth_logout()
+            return
+
+        # ── All other POST routes require auth ────────────────────
+        user = self._require_auth()
+        if not user:
+            return
+
         if parsed_path.path == '/chat':
             self.handle_chat()
         elif parsed_path.path == '/sessions':
-            self.handle_create_session()
+            self.handle_create_session(user)
         elif parsed_path.path == '/indexes':
             self.handle_create_index()
+        elif parsed_path.path == '/admin/users':
+            self.handle_admin_create_user(user)
+        elif parsed_path.path.startswith('/admin/users/'):
+            uid = parsed_path.path.split('/')[-1]
+            self.handle_admin_update_user(user, uid)
         elif parsed_path.path.startswith('/indexes/') and parsed_path.path.endswith('/upload'):
             index_id = parsed_path.path.split('/')[-2]
             self.handle_index_file_upload(index_id)
@@ -105,6 +176,11 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         elif parsed_path.path.startswith('/sessions/') and parsed_path.path.endswith('/messages'):
             session_id = parsed_path.path.split('/')[-2]
             self.handle_session_chat(session_id)
+        elif parsed_path.path == '/audit/log':
+            self.handle_log_audit_entry()
+        elif parsed_path.path.startswith('/audit/') and parsed_path.path.endswith('/review'):
+            audit_id = parsed_path.path.split('/')[-2]
+            self.handle_mark_reviewed(audit_id)
         elif parsed_path.path.startswith('/sessions/') and parsed_path.path.endswith('/upload'):
             session_id = parsed_path.path.split('/')[-2]
             self.handle_file_upload(session_id)
@@ -121,7 +197,9 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
     def do_DELETE(self):
         """Handle DELETE requests"""
         parsed_path = urlparse(self.path)
-        
+        user = self._require_auth()
+        if not user:
+            return
         if parsed_path.path.startswith('/sessions/') and parsed_path.path.count('/') == 2:
             session_id = parsed_path.path.split('/')[-1]
             self.handle_delete_session(session_id)
@@ -132,6 +210,117 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
     
+    # ── Auth handlers ─────────────────────────────────────────────
+
+    def handle_auth_login(self):
+        try:
+            data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            email = data.get("email", "").strip()
+            password = data.get("password", "")
+            if not email or not password:
+                self.send_json_response({"error": "email and password required"}, status_code=400)
+                return
+            user = db.get_user_by_email(email)
+            if not user or not verify_password(password, user["password_hash"]):
+                self.send_json_response({"error": "Invalid email or password"}, status_code=401)
+                return
+            if not user["is_active"]:
+                self.send_json_response({"error": "Account is disabled"}, status_code=403)
+                return
+            token = db.create_auth_token(user["id"])
+            self.send_json_response({
+                "token": token,
+                "user": {"id": user["id"], "email": user["email"],
+                         "name": user["name"], "role": user["role"]}
+            })
+        except Exception as e:
+            self.send_json_response({"error": str(e)}, status_code=500)
+
+    def handle_auth_logout(self):
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            db.revoke_token(auth[7:].strip())
+        self.send_json_response({"message": "Logged out"})
+
+    # ── Admin user-management handlers ────────────────────────────
+
+    def handle_admin_list_users(self, current_user):
+        if current_user.get("role") != "admin":
+            self.send_json_response({"error": "Forbidden"}, status_code=403)
+            return
+        users = db.list_users()
+        # Never expose password_hash
+        for u in users:
+            u.pop("password_hash", None)
+        self.send_json_response({"users": users, "total": len(users)})
+
+    def handle_admin_create_user(self, current_user):
+        if current_user.get("role") != "admin":
+            self.send_json_response({"error": "Forbidden"}, status_code=403)
+            return
+        try:
+            data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            email = data.get("email", "").strip()
+            name = data.get("name", "").strip()
+            role = data.get("role", "attorney")
+            password = data.get("password", "")
+            if not email or not name or not password:
+                self.send_json_response({"error": "email, name and password are required"}, status_code=400)
+                return
+            if role not in ("admin", "attorney", "paralegal"):
+                self.send_json_response({"error": "role must be admin, attorney, or paralegal"}, status_code=400)
+                return
+            if db.get_user_by_email(email):
+                self.send_json_response({"error": "Email already in use"}, status_code=409)
+                return
+            uid = db.create_user(email, name, role, password)
+            self.send_json_response({"message": "User created", "user_id": uid}, status_code=201)
+        except Exception as e:
+            self.send_json_response({"error": str(e)}, status_code=500)
+
+    def handle_admin_update_user(self, current_user, target_uid):
+        if current_user.get("role") != "admin":
+            self.send_json_response({"error": "Forbidden"}, status_code=403)
+            return
+        try:
+            data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            updates = {}
+            if "name" in data:
+                updates["name"] = data["name"].strip()
+            if "role" in data and data["role"] in ("admin", "attorney", "paralegal"):
+                updates["role"] = data["role"]
+            if "is_active" in data:
+                updates["is_active"] = 1 if data["is_active"] else 0
+            if "password" in data and data["password"]:
+                updates["password_hash"] = hash_password(data["password"])
+                db.revoke_all_tokens_for_user(target_uid)
+            if not db.update_user(target_uid, updates):
+                self.send_json_response({"error": "User not found"}, status_code=404)
+                return
+            self.send_json_response({"message": "User updated"})
+        except Exception as e:
+            self.send_json_response({"error": str(e)}, status_code=500)
+
+    # ── Session handler overrides ─────────────────────────────────
+
+    def handle_get_sessions(self, user=None):
+        uid = user["id"] if user else None
+        role = user.get("role") if user else None
+        sessions = db.get_sessions_for_user(uid, role) if uid else db.get_sessions()
+        self.send_json_response({"sessions": sessions, "total": len(sessions)})
+
+    def handle_create_session(self, user=None):
+        try:
+            data = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0) or 0)))
+            title = data.get('title', 'New Chat')
+            model = data.get('model', 'qwen2.5:14b')
+            uid = user["id"] if user else None
+            session_id = db.create_session(title, model, user_id=uid)
+            session = db.get_session(session_id)
+            self.send_json_response({"session_id": session_id, "session": session}, status_code=201)
+        except Exception as e:
+            self.send_json_response({"error": str(e)}, status_code=500)
+
     def handle_chat(self):
         """Handle legacy chat requests (without sessions)"""
         try:
@@ -172,19 +361,6 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json_response({
                 "error": f"Server error: {str(e)}"
-            }, status_code=500)
-    
-    def handle_get_sessions(self):
-        """Get all chat sessions"""
-        try:
-            sessions = db.get_sessions()
-            self.send_json_response({
-                "sessions": sessions,
-                "total": len(sessions)
-            })
-        except Exception as e:
-            self.send_json_response({
-                "error": f"Failed to get sessions: {str(e)}"
             }, status_code=500)
     
     def handle_cleanup_sessions(self):
@@ -242,28 +418,6 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         except Exception as e:
             self.send_json_response({"error": f"Failed to get documents: {str(e)}"}, status_code=500)
     
-    def handle_create_session(self):
-        """Create a new chat session"""
-        try:
-            content_length = int(self.headers['Content-Length'])
-            post_data = self.rfile.read(content_length)
-            data = json.loads(post_data.decode('utf-8'))
-            
-            title = data.get('title', 'New Chat')
-            model = data.get('model', 'llama3.2:latest')
-            
-            session_id = db.create_session(title, model)
-            session = db.get_session(session_id)
-            
-            self.send_json_response({
-                "session": session,
-                "session_id": session_id
-            }, status_code=201)
-            
-        except json.JSONDecodeError:
-            self.send_json_response({
-                "error": "Invalid JSON"
-            }, status_code=400)
         except Exception as e:
             self.send_json_response({
                 "error": f"Failed to create session: {str(e)}"
@@ -312,7 +466,20 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
             # Add AI response to database
             ai_message_id = db.add_message(session_id, response_text, "assistant")
-            
+
+            # ── Audit log: record every AI interaction ──────────────────────
+            kb_gap = '⚠️' in response_text or 'Knowledge Base Gap' in response_text
+            audit_entry_id = db.log_interaction(
+                session_id=session_id,
+                user_query=message,
+                ai_response=response_text,
+                source_documents=source_docs,
+                kb_gap_flagged=kb_gap,
+                used_rag=use_rag,
+                message_id=ai_message_id,
+            )
+            # ───────────────────────────────────────────────────────────────
+
             updated_session = db.get_session(session_id)
             
             # Send response with proper error handling
@@ -320,7 +487,9 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
                 "response": response_text,
                 "session": updated_session,
                 "source_documents": source_docs,
-                "used_rag": use_rag
+                "used_rag": use_rag,
+                "audit_entry_id": audit_entry_id,
+                "ai_message_id": ai_message_id,
             })
             
         except BrokenPipeError:
@@ -1077,6 +1246,122 @@ Respond with exactly one word: USE_RAG or DIRECT_LLM"""
             self.send_json_response({"error": "Invalid JSON"}, status_code=400)
         except Exception as e:
             self.send_json_response({"error": f"Failed to rename session: {str(e)}"}, status_code=500)
+
+    # ─────────────────────────────────────────────────────────────────
+    # Audit log endpoints
+    # ─────────────────────────────────────────────────────────────────
+
+    def handle_get_audit_log(self):
+        """GET /audit  – list entries with optional filters"""
+        try:
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            limit  = int(qs.get('limit',  ['50'])[0])
+            offset = int(qs.get('offset', ['0'])[0])
+            reviewed_param = qs.get('reviewed', [None])[0]
+            reviewed = None
+            if reviewed_param == 'true':
+                reviewed = True
+            elif reviewed_param == 'false':
+                reviewed = False
+            date_from  = qs.get('date_from',  [None])[0]
+            date_to    = qs.get('date_to',    [None])[0]
+            session_id = qs.get('session_id', [None])[0]
+
+            rows, total = db.get_audit_log(
+                limit=limit, offset=offset,
+                reviewed=reviewed,
+                date_from=date_from, date_to=date_to,
+                session_id=session_id,
+            )
+            self.send_json_response({
+                'entries': rows,
+                'total': total,
+                'limit': limit,
+                'offset': offset,
+            })
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, status_code=500)
+
+    def handle_get_audit_entry(self, audit_id: str):
+        """GET /audit/{id}"""
+        entry = db.get_audit_entry(audit_id)
+        if entry is None:
+            self.send_json_response({'error': 'Not found'}, status_code=404)
+        else:
+            self.send_json_response(entry)
+
+    def handle_mark_reviewed(self, audit_id: str):
+        """POST /audit/{id}/review"""
+        try:
+            data = {}
+            length = int(self.headers.get('Content-Length', 0))
+            if length:
+                data = json.loads(self.rfile.read(length).decode('utf-8'))
+            reviewer = data.get('reviewed_by', 'Attorney')
+            found = db.mark_reviewed(audit_id, reviewed_by=reviewer)
+            if found:
+                self.send_json_response({'message': 'Marked as reviewed', 'id': audit_id})
+            else:
+                self.send_json_response({'error': 'Audit entry not found'}, status_code=404)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, status_code=500)
+
+    def handle_log_audit_entry(self):
+        """POST /audit/log  – used by streaming path (frontend calls after stream completes)"""
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            data = json.loads(self.rfile.read(length).decode('utf-8'))
+            required = {'session_id', 'user_query', 'ai_response'}
+            if not required.issubset(data.keys()):
+                self.send_json_response({'error': f'Missing fields: {required - data.keys()}'}, status_code=400)
+                return
+            kb_gap = '⚠️' in data['ai_response'] or 'Knowledge Base Gap' in data['ai_response']
+            entry_id = db.log_interaction(
+                session_id=data['session_id'],
+                user_query=data['user_query'],
+                ai_response=data['ai_response'],
+                source_documents=data.get('source_documents', []),
+                kb_gap_flagged=kb_gap,
+                used_rag=data.get('used_rag', False),
+                message_id=data.get('message_id'),
+            )
+            self.send_json_response({'audit_entry_id': entry_id})
+        except json.JSONDecodeError:
+            self.send_json_response({'error': 'Invalid JSON'}, status_code=400)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, status_code=500)
+
+    def handle_export_audit_log(self):
+        """GET /audit/export  – download as CSV"""
+        try:
+            import csv, io
+            rows, _ = db.get_audit_log(limit=10000, offset=0)
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow([
+                'id', 'session_id', 'created_at', 'user_query', 'ai_response',
+                'used_rag', 'kb_gap_flagged', 'reviewed_at', 'reviewed_by',
+                'source_count',
+            ])
+            for r in rows:
+                writer.writerow([
+                    r['id'], r['session_id'], r['created_at'],
+                    r['user_query'], r['ai_response'],
+                    bool(r['used_rag']), bool(r['kb_gap_flagged']),
+                    r['reviewed_at'] or '', r['reviewed_by'] or '',
+                    len(r.get('source_documents') or []),
+                ])
+            csv_bytes = output.getvalue().encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/csv; charset=utf-8')
+            self.send_header('Content-Disposition', 'attachment; filename="audit_log.csv"')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Content-Length', str(len(csv_bytes)))
+            self.end_headers()
+            self.wfile.write(csv_bytes)
+        except Exception as e:
+            self.send_json_response({'error': str(e)}, status_code=500)
 
     def send_json_response(self, data, status_code: int = 200):
         """Send a JSON (UTF-8) response with CORS headers. Safe against client disconnects."""
