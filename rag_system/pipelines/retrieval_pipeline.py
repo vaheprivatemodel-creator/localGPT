@@ -232,34 +232,39 @@ Instructions
    Lawful Pathways", "Convention Against Torture", "particular social group"). Treat the
    acronym and the spelled-out form as the same concept. Never claim the snippets "do not
    mention" an acronym just because they use the full name instead.
-2. Evaluate each snippet for relevance to the ORIGINAL QUESTION; ignore those that do not help.
-3. Synthesise an answer **using only information from the relevant snippets**.
-4. INLINE CITATIONS REQUIRED: For every factual claim, cite the supporting snippet(s)
+2. AUTHORITY PRE-CHECK (do this before writing the answer):
+   Based solely on your legal knowledge and the ORIGINAL QUESTION, name the 1-3 primary
+   controlling legal authorities that would normally govern this type of question — e.g.
+   the specific CFR section, INA provision, or leading BIA/AG/court precedent. Write them
+   down internally. Then check whether each appears by citation in any snippet [S1]–[SN].
+   Any authority that is absent from the snippets MUST be listed in the Knowledge Base Gap
+   section at the end of your answer (step 8).
+3. Evaluate each snippet for relevance to the ORIGINAL QUESTION; ignore those that do not help.
+4. Synthesise an answer **using only information from the relevant snippets**.
+5. INLINE CITATIONS REQUIRED: For every factual claim, cite the supporting snippet(s)
    inline using their bracketed label(s), e.g. "Derivative beneficiaries may follow-to-join
    under INA § 208(b)(3)(A) [S3][S7]." A claim without a citation is invalid. When the
    snippet itself contains a regulation cite (e.g. 8 C.F.R. § 1208.33(a)(2)(ii)) quote that
    cite alongside the label, e.g. "[S3, 8 C.F.R. § 1208.33(a)(2)(ii)]".
-5. CASE-LAW CITATIONS: If a snippet contains a court case citation relevant to the question
+6. CASE-LAW CITATIONS: If a snippet contains a court case citation relevant to the question
    (federal-court format: "Smith v. Jones, 123 F.3d 456, 459 (9th Cir. 2011)"), preserve it
    verbatim in your answer alongside its [S#] tag — party names, reporter volume/series/page,
    pin-cite (the second number after the comma, e.g. "459"), court, and year. Do NOT abbreviate
    to just "Smith v. Jones"; the reader needs the pin-cite to actually look the case up. Never
    invent a case citation that is not literally in a snippet.
-6. If snippets contradict one another, mention the contradiction explicitly with citations.
-7. If the snippets genuinely do not contain the needed information AFTER acronym resolution,
+7. If snippets contradict one another, mention the contradiction explicitly with citations.
+8. If the snippets genuinely do not contain the needed information AFTER acronym resolution,
    reply: "I could not find that information in the provided documents." and then briefly
    state what the documents DO cover that is adjacent (with citations).
-8. KNOWLEDGE-BASE GAP FLAG: After your answer, scan your reasoning for any specific legal
-   authorities (CFR sections, INA sections, BIA/AG/court decisions, statutes) that are
-   directly relevant to the question but were NOT present in any retrieved snippet. If any
-   are missing, append a clearly separated section:
+9. KNOWLEDGE-BASE GAP FLAG: Using your Authority Pre-Check from step 2, append a clearly
+   separated section for every controlling authority that was NOT found in the snippets:
    "⚠️ Knowledge Base Gap – the following authorities appear relevant but were not found
    in the indexed documents. Consider adding them to the knowledge base: [list each item]"
-   Only include items that are genuinely controlling or highly relevant — do not list every
-   possible citation. If nothing is missing, omit this section entirely.
-9. Provide a thorough, well-structured answer. Use paragraphs or bullet points where helpful.
-10. Do NOT append a "[Confidence: N%]" line — that is added by a separate verifier.
-11. Do NOT introduce external knowledge unless step 7 applies; if you do, label the sentence
+   Err on the side of flagging — a false positive is far less harmful than a missed gap.
+   Only omit this section entirely if every authority from step 2 was present in a snippet.
+10. Provide a thorough, well-structured answer. Use paragraphs or bullet points where helpful.
+11. Do NOT append a "[Confidence: N%]" line — that is added by a separate verifier.
+12. Do NOT introduce external knowledge unless step 8 applies; if you do, label the sentence
     "General knowledge:".
 
 Output format
