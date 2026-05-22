@@ -602,6 +602,7 @@ Respond with exactly one word: USE_RAG or DIRECT_LLM"""
 
         # Copy optional parameters from the incoming request
         optional_params: Dict[str, tuple[type, str]] = {
+            "force_rag": (bool, "force_rag"),
             "compose_sub_answers": (bool, "compose_sub_answers"),
             "query_decompose": (bool, "query_decompose"),
             "ai_rerank": (bool, "ai_rerank"),
