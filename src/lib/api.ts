@@ -628,7 +628,6 @@ class ChatAPI {
       }
     }
   }
-}
 
   // ─────────────────────── Audit log ───────────────────────
 
@@ -686,20 +685,7 @@ class ChatAPI {
       ? `${API_BASE_URL}/audit/export?token=${token}`
       : `${API_BASE_URL}/audit/export`;
   }
-}
 
-export interface AuditEntry {
-  id: string;
-  session_id: string;
-  message_id: string | null;
-  user_query: string;
-  ai_response: string;
-  source_documents: unknown[];
-  kb_gap_flagged: number;
-  used_rag: number;
-  created_at: string;
-  reviewed_at: string | null;
-  reviewed_by: string | null;
   // -------------------- Admin user management --------------------
 
   async listUsers(): Promise<{ users: any[]; total: number }> {
@@ -733,6 +719,20 @@ export interface AuditEntry {
     }
     return resp.json();
   }
+}
+
+export interface AuditEntry {
+  id: string;
+  session_id: string;
+  message_id: string | null;
+  user_query: string;
+  ai_response: string;
+  source_documents: unknown[];
+  kb_gap_flagged: number;
+  used_rag: number;
+  created_at: string;
+  reviewed_at: string | null;
+  reviewed_by: string | null;
 }
 
 export const chatAPI = new ChatAPI(); 
