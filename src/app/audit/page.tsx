@@ -146,6 +146,32 @@ export default function AuditPage() {
   const [filterGap, setFilterGap] = useState(false)
   const [loading, setLoading] = useState(true)
   const [pendingCount, setPendingCount] = useState(0)
+  const [exporting, setExporting] = useState(false)
+
+  const handleExport = useCallback(async () => {
+    setExporting(true)
+    try {
+      const token = typeof window !== "undefined" ? localStorage.getItem("auth_token") : null
+      const url = token
+        ? `http://localhost:8002/audit/export?token=${token}`
+        : "http://localhost:8002/audit/export"
+      const resp = await fetch(url)
+      if (!resp.ok) throw new Error(`Export failed: ${resp.status}`)
+      const blob = await resp.blob()
+      const objectUrl = URL.createObjectURL(blob)
+      const a = document.createElement("a")
+      a.href = objectUrl
+      a.download = "audit_log.csv"
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(objectUrl)
+    } catch (err) {
+      alert("Export failed — are you logged in?")
+    } finally {
+      setExporting(false)
+    }
+  }, [])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -188,13 +214,14 @@ export default function AuditPage() {
           </span>
         )}
         <div className="flex-1" />
-        <a
-          href={chatAPI.getAuditExportUrl()}
-          download="audit_log.csv"
-          className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded border border-gray-700 text-gray-300 hover:bg-gray-800 transition-colors"
+        <button
+          onClick={handleExport}
+          disabled={exporting}
+          className="flex items-center gap-1.5 text-sm px-3 py-1.5 rounded border border-gray-700 text-gray-300 hover:bg-gray-800 transition-colors disabled:opacity-50"
         >
-          <Download className="w-4 h-4" /> Export CSV
-        </a>
+          <Download className="w-4 h-4" />
+          {exporting ? "Exporting…" : "Export CSV"}
+        </button>
       </header>
 
       {/* Filters */}
