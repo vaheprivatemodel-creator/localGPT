@@ -50,14 +50,19 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
     # ── Auth helpers ─────────────────────────────────────────────
 
     def _get_current_user(self):
-        """Extract Bearer token and return the user dict, or None."""
+        """Extract Bearer token (header or ?token= query param) and return the user dict, or None."""
+        # 1. Try Authorization header
         auth = self.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return None
-        token = auth[7:].strip()
-        if not token:
-            return None
-        return db.get_user_by_token(token)
+        if auth.startswith("Bearer "):
+            token = auth[7:].strip()
+            if token:
+                return db.get_user_by_token(token)
+        # 2. Fall back to ?token= query param (needed for direct browser download links)
+        qs = parse_qs(urlparse(self.path).query)
+        token = qs.get("token", [None])[0]
+        if token:
+            return db.get_user_by_token(token)
+        return None
 
     def _require_auth(self):
         """Return user dict or send 401 and return None."""
