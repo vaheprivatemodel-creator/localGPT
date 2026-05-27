@@ -9,6 +9,9 @@ from rag_system.indexing.graph_extractor import GraphExtractor
 from rag_system.utils.ollama_client import OllamaClient
 from rag_system.indexing.contextualizer import ContextualEnricher
 from rag_system.indexing.overview_builder import OverviewBuilder
+from rag_system.vectorstore import legacy_to_qdrant_name
+from rag_system.vectorstore.qdrant_store import QdrantManager, QdrantVectorIndexer
+from rag_system.vectorstore.bm25_sidecar import Bm25Sidecar
 
 class IndexingPipeline:
     def __init__(self, config: Dict[str, Any], ollama_client: OllamaClient, ollama_config: Dict[str, str]):
@@ -62,27 +65,46 @@ class IndexingPipeline:
         dense_cfg = retriever_configs.setdefault("dense", {})
         dense_cfg.setdefault("enabled", True)
 
+        self.vector_backend = str(self.config.get("vector_backend", "lancedb")).lower()
+        print(f"🗄️  VECTOR BACKEND: {self.vector_backend}")
+
         if dense_cfg.get("enabled"):
-            # Accept modern keys: db_path or lancedb_path; fall back to legacy lancedb_uri
-            db_path = (
-                storage_config.get("db_path")
-                or storage_config.get("lancedb_path")
-                or storage_config.get("lancedb_uri")
-            )
-            if not db_path:
-                raise KeyError(
-                    "Storage config must include 'db_path', 'lancedb_path', or 'lancedb_uri' for LanceDB."
-                )
-            self.lancedb_manager = LanceDBManager(db_path=db_path)
-            self.vector_indexer = VectorIndexer(self.lancedb_manager)
             embedding_model = select_embedder(
                 self.config.get("embedding_model_name", "BAAI/bge-small-en-v1.5"),
                 self.ollama_config.get("host") if isinstance(self.ollama_config, dict) else None,
             )
             self.embedding_generator = EmbeddingGenerator(
-                embedding_model=embedding_model, 
-                batch_size=self.embedding_batch_size
+                embedding_model=embedding_model,
+                batch_size=self.embedding_batch_size,
             )
+
+            if self.vector_backend == "qdrant":
+                qdrant_path = (
+                    storage_config.get("qdrant_path")
+                    or storage_config.get("db_path")
+                    or "./qdrant_data"
+                )
+                self.qdrant_manager = QdrantManager(path=qdrant_path)
+                self.vector_indexer = QdrantVectorIndexer(self.qdrant_manager)
+                self.bm25_sidecar = Bm25Sidecar(
+                    bm25_dir=storage_config.get("bm25_path", "./index_store/bm25")
+                )
+                # Some legacy call-sites read .lancedb_manager; keep it None so
+                # they fall through to the new code path.
+                self.lancedb_manager = None
+            else:
+                # Accept modern keys: db_path or lancedb_path; fall back to legacy lancedb_uri
+                db_path = (
+                    storage_config.get("db_path")
+                    or storage_config.get("lancedb_path")
+                    or storage_config.get("lancedb_uri")
+                )
+                if not db_path:
+                    raise KeyError(
+                        "Storage config must include 'db_path', 'lancedb_path', or 'lancedb_uri' for LanceDB."
+                    )
+                self.lancedb_manager = LanceDBManager(db_path=db_path)
+                self.vector_indexer = VectorIndexer(self.lancedb_manager)
 
         if retriever_configs.get("graph", {}).get("enabled"):
             self.graph_extractor = GraphExtractor(
@@ -246,44 +268,55 @@ class IndexingPipeline:
             # Step 4: Create BM25 Index from enriched chunks (for consistency with vector index)
             if hasattr(self, 'vector_indexer') and hasattr(self, 'embedding_generator'):
                 with timer("Vector Embedding & Indexing"):
-                    table_name = self.config["storage"].get("text_table_name") or retriever_configs.get("dense", {}).get("lancedb_table_name", "default_text_table")
+                    raw_table_name = self.config["storage"].get("text_table_name") or retriever_configs.get("dense", {}).get("lancedb_table_name", "default_text_table")
+                    # When using Qdrant, translate legacy table names to the
+                    # canonical kb_<id> collection naming so old session metadata
+                    # keeps working untouched.
+                    if self.vector_backend == "qdrant":
+                        table_name = legacy_to_qdrant_name(raw_table_name)
+                    else:
+                        table_name = raw_table_name
                     print(f"\n--- Generating embeddings with {self.config.get('embedding_model_name')} ---")
-                    
+
                     embeddings = self.embedding_generator.generate(all_chunks)
-                    
-                    print(f"\n--- Indexing {len(embeddings)} vectors into LanceDB table: {table_name} ---")
+
+                    print(f"\n--- Indexing {len(embeddings)} vectors into {self.vector_backend} '{table_name}' ---")
                     self.vector_indexer.index(table_name, all_chunks, embeddings)
                     print("✅ Vector embeddings indexed successfully")
 
-                    # Create FTS index on the 'text' field after adding data
-                    print(f"\n--- Ensuring Full-Text Search (FTS) index on table '{table_name}' ---")
-                    try:
-                        tbl = self.lancedb_manager.get_table(table_name)
-                        # LanceDB's default index name is "text_idx" while older
-                        # revisions of this pipeline used our own name "fts_text".
-                        # Guard against both so we don't attempt to create a     
-                        # duplicate index and trigger a LanceError.
-                        existing_indices = [idx.name for idx in tbl.list_indices()]
-                        if not any(name in existing_indices for name in ("text_idx", "fts_text")):
-                            # Use LanceDB default index naming ("text_idx")
-                            tbl.create_fts_index(
-                                "text",
-                                use_tantivy=False,
-                                replace=False,
-                            )
-                            print("✅ FTS index created successfully (using Lance native FTS).")
-                        else:
-                            print("ℹ️  FTS index already exists – skipped creation.")
-                    except Exception as e:
-                        print(f"❌ Failed to create/verify FTS index: {e}")
+                    if self.vector_backend == "qdrant":
+                        # Keep BM25 sidecar in lock-step with Qdrant so hybrid
+                        # retrieval has both legs available immediately.
+                        try:
+                            self.bm25_sidecar.add(table_name, all_chunks)
+                        except Exception as e:
+                            print(f"⚠️  BM25 sidecar update failed for '{table_name}': {e}")
+                    else:
+                        # Create FTS index on the 'text' field after adding data
+                        print(f"\n--- Ensuring Full-Text Search (FTS) index on table '{table_name}' ---")
+                        try:
+                            tbl = self.lancedb_manager.get_table(table_name)
+                            existing_indices = [idx.name for idx in tbl.list_indices()]
+                            if not any(name in existing_indices for name in ("text_idx", "fts_text")):
+                                tbl.create_fts_index(
+                                    "text",
+                                    use_tantivy=False,
+                                    replace=False,
+                                )
+                                print("✅ FTS index created successfully (using Lance native FTS).")
+                            else:
+                                print("ℹ️  FTS index already exists – skipped creation.")
+                        except Exception as e:
+                            print(f"❌ Failed to create/verify FTS index: {e}")
 
                     # ---------------------------------------------------
                     # Late-Chunk Embedding + Indexing (optional)
                     # ---------------------------------------------------
                     if self.latechunk_enabled:
                         with timer("Late-Chunk Embedding & Indexing"):
-                            lc_table_name = self.latechunk_cfg.get("lancedb_table_name", f"{table_name}_lc")
-                            print(f"\n--- Generating late-chunk embeddings (table={lc_table_name}) ---")
+                            raw_lc_table = self.latechunk_cfg.get("lancedb_table_name", f"{raw_table_name}_lc")
+                            lc_table_name = legacy_to_qdrant_name(raw_lc_table) if self.vector_backend == "qdrant" else raw_lc_table
+                            print(f"\n--- Generating late-chunk embeddings ({self.vector_backend}={lc_table_name}) ---")
 
                             total_lc_vecs = 0
                             for doc_id, doc_chunks in doc_chunks_map.items():
@@ -314,6 +347,11 @@ class IndexingPipeline:
                                     continue
 
                                 self.vector_indexer.index(lc_table_name, doc_chunks, lc_vecs)
+                                if self.vector_backend == "qdrant":
+                                    try:
+                                        self.bm25_sidecar.add(lc_table_name, doc_chunks)
+                                    except Exception as e:
+                                        print(f"⚠️  BM25 sidecar update failed for LC '{lc_table_name}': {e}")
                                 total_lc_vecs += len(lc_vecs)
 
                             print(f"✅ Late-chunk vectors indexed: {total_lc_vecs}")

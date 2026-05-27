@@ -598,8 +598,8 @@ class ChatDatabase:
 
         if deleted:
             print(f"🗑️ Deleted index {index_id[:8]}... and related records")
-            # Optional: attempt to drop LanceDB table if available
             if vector_table_name:
+                # Drop from the LanceDB backend if it has a matching table…
                 try:
                     from rag_system.indexing.embedders import LanceDBManager
                     import os
@@ -611,6 +611,28 @@ class ChatDatabase:
                         print(f"🚮 Dropped LanceDB table '{vector_table_name}'")
                 except Exception as e:
                     print(f"⚠️ Could not drop LanceDB table '{vector_table_name}': {e}")
+
+                # …and from the Qdrant backend (plus BM25 sidecar).
+                try:
+                    import os
+                    from rag_system.vectorstore import legacy_to_qdrant_name
+                    from rag_system.vectorstore.qdrant_store import QdrantManager
+                    from rag_system.vectorstore.bm25_sidecar import Bm25Sidecar
+
+                    qdrant_path = os.getenv('QDRANT_PATH') or './qdrant_data'
+                    bm25_dir = os.getenv('BM25_PATH') or './index_store/bm25'
+                    coll = legacy_to_qdrant_name(vector_table_name)
+                    QdrantManager(path=qdrant_path).delete_collection(coll)
+                    Bm25Sidecar(bm25_dir).delete(coll)
+                    # Also clean the late-chunk sibling collection if present.
+                    lc_coll = coll + "_lc" if not coll.endswith("_lc") else coll
+                    try:
+                        QdrantManager(path=qdrant_path).delete_collection(lc_coll)
+                        Bm25Sidecar(bm25_dir).delete(lc_coll)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"⚠️ Could not drop Qdrant collection for '{vector_table_name}': {e}")
         return deleted
 
     def update_index_metadata(self, index_id: str, updates: dict):

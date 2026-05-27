@@ -57,7 +57,12 @@ backend/shared_uploads/
 
 # Vector DB artefacts
 lancedb/
+qdrant_data/
 index_store/overviews/
+
+# Evaluation runtime
+eval_corpus/
+evaluation/results/
 
 # Logs and runtime output
 logs/

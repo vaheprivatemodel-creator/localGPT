@@ -1,5 +1,61 @@
 # LocalGPT - Private Document Intelligence Platform
 
+> **Branch note (`experiment/qdrant-vector-db`).** This branch swaps the default
+> vector backend from LanceDB to **Qdrant** (embedded, no Docker), adds **DOCX**
+> ingestion, ships an automated **CLP-derivative evaluation rubric**, and keeps
+> the LanceDB path available behind `VECTOR_BACKEND=lancedb` for instant rollback.
+> See [`PATCH_NOTES.md`](./PATCH_NOTES.md) `v7` for the full delta.
+>
+> ## macOS Mac Studio quick-start (Apple Silicon, 36 GB)
+>
+> ```bash
+> # System deps (run once)
+> brew install ollama tesseract ocrmypdf node@20
+> ollama pull qwen2.5:14b nomic-embed-text qwen3:0.6b llama3.1:8b
+>
+> # Repo setup
+> git clone <this fork>
+> cd localGPT
+> python3.11 -m venv .venv && source .venv/bin/activate
+> pip install -r requirements.txt qdrant-client
+> npm install   # frontend
+>
+> # Run
+> ollama serve &
+> python -m rag_system.api_server &   # RAG API on :8001
+> python -m backend.server  &         # multi-user backend on :8000
+> npm run dev                          # Next.js UI on :3000
+> ```
+>
+> ## CLP-derivative evaluation
+>
+> ```bash
+> source .venv/bin/activate
+> python -m evaluation.clp_eval \
+>     --corpus eval_corpus \
+>     --kb-id clp_eval_001 \
+>     --reindex
+> ```
+>
+> Re-ingests the corpus into Qdrant collection `kb_clp_eval_001`, asks the
+> primary CLP-derivative question plus 5 secondary stress tests, scores each
+> against the 12-check rubric in `evaluation/clp_rubric.py`, and writes a JSON
+> report to `evaluation/results/`. Required setup: place the TPS/INA/9th-cir
+> documents under `eval_corpus/` (one PDF/DOCX per file).
+>
+> ## Environment variables
+>
+> | Var | Default | Effect |
+> |---|---|---|
+> | `VECTOR_BACKEND` | `qdrant` | `lancedb` to revert to the legacy backend |
+> | `QDRANT_PATH` | `./qdrant_data` | Embedded Qdrant storage dir |
+> | `OLLAMA_HOST` | `http://localhost:11434` | LLM endpoint |
+> | `GENERATION_MODEL` | `qwen2.5:14b` | Answer LLM |
+> | `ENRICHMENT_MODEL` | `qwen3:0.6b` | Per-chunk contextual enrichment LLM |
+>
+> ---
+
+
 <div align="center">
 
 <p align="center">

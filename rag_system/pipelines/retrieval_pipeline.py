@@ -17,6 +17,10 @@ from rag_system.indexing.representations import select_embedder
 from rag_system.indexing.embedders import LanceDBManager
 from rag_system.rerankers.reranker import QwenReranker
 from rag_system.rerankers.sentence_pruner import SentencePruner
+from rag_system.vectorstore import legacy_to_qdrant_name
+from rag_system.vectorstore.qdrant_store import QdrantManager
+from rag_system.vectorstore.qdrant_retriever import QdrantMultiVectorRetriever
+from rag_system.vectorstore.bm25_sidecar import Bm25Sidecar
 # from rag_system.indexing.chunk_store import ChunkStore
 
 import os
@@ -52,9 +56,12 @@ class RetrievalPipeline:
         # Support both legacy "retrievers" key and newer "retrieval" key
         self.retriever_configs = self.config.get("retrievers") or self.config.get("retrieval", {})
         self.storage_config = self.config["storage"]
-        
+        self.vector_backend = str(self.config.get("vector_backend", "lancedb")).lower()
+
         # Defer initialization to just-in-time methods
         self.db_manager = None
+        self.qdrant_manager: Optional[QdrantManager] = None
+        self.bm25_sidecar: Optional[Bm25Sidecar] = None
         self.text_embedder = None
         self.dense_retriever = None
         self.bm25_retriever = None
@@ -62,15 +69,32 @@ class RetrievalPipeline:
         self._graph_retriever = None
         self.reranker = None
         self.ai_reranker = None
+        # Optional defence-in-depth user_id filter (set by server.py per-request)
+        self.active_user_id: Optional[str] = None
 
     def _get_db_manager(self):
+        """Backwards-compatible accessor. On Qdrant backend, returns the
+        QdrantManager; on LanceDB, the LanceDBManager. Code paths that touch
+        Lance-specific APIs gate on ``self.vector_backend``.
+        """
+        if self.vector_backend == "qdrant":
+            if self.qdrant_manager is None:
+                qpath = self.storage_config.get("qdrant_path") or "./qdrant_data"
+                self.qdrant_manager = QdrantManager(path=qpath)
+            return self.qdrant_manager
         if self.db_manager is None:
-            # Accept either "db_path" (preferred) or legacy "lancedb_uri"
             db_path = self.storage_config.get("db_path") or self.storage_config.get("lancedb_uri")
             if not db_path:
                 raise ValueError("Storage config must contain 'db_path' or 'lancedb_uri'.")
             self.db_manager = LanceDBManager(db_path=db_path)
         return self.db_manager
+
+    def _get_bm25_sidecar(self) -> Bm25Sidecar:
+        if self.bm25_sidecar is None:
+            self.bm25_sidecar = Bm25Sidecar(
+                bm25_dir=self.storage_config.get("bm25_path", "./index_store/bm25")
+            )
+        return self.bm25_sidecar
 
     def _get_text_embedder(self):
         if self.text_embedder is None:
@@ -89,15 +113,23 @@ class RetrievalPipeline:
                 return None
 
             try:
-                db_manager = self._get_db_manager()
                 text_embedder = self._get_text_embedder()
                 fusion_cfg = self.config.get("fusion", {})
-                self.dense_retriever = MultiVectorRetriever(
-                    db_manager,
-                    text_embedder,
-                    vision_model=None,
-                    fusion_config=fusion_cfg,
-                )
+                if self.vector_backend == "qdrant":
+                    self.dense_retriever = QdrantMultiVectorRetriever(
+                        qdrant_manager=self._get_db_manager(),
+                        text_embedder=text_embedder,
+                        bm25_sidecar=self._get_bm25_sidecar(),
+                        fusion_config=fusion_cfg,
+                        user_id=self.active_user_id,
+                    )
+                else:
+                    self.dense_retriever = MultiVectorRetriever(
+                        self._get_db_manager(),
+                        text_embedder,
+                        vision_model=None,
+                        fusion_config=fusion_cfg,
+                    )
             except Exception as e:
                 print(f"❌ Failed to initialise dense retriever: {e}")
                 self.dense_retriever = None
@@ -169,8 +201,37 @@ class RetrievalPipeline:
 
     def _get_surrounding_chunks_lancedb(self, chunk: Dict[str, Any], window_size: int) -> List[Dict[str, Any]]:
         """
-        Retrieves a window of chunks around a central chunk using LanceDB.
+        Retrieves a window of chunks around a central chunk.
+
+        Despite the legacy name, this dispatches to the configured vector
+        backend so call-sites don't need to know which one is active.
         """
+        # ------------------------------------------------------------------
+        # Qdrant fast-path
+        # ------------------------------------------------------------------
+        if self.vector_backend == "qdrant":
+            document_id = chunk.get("document_id")
+            chunk_index = chunk.get("chunk_index")
+            if document_id is None or chunk_index is None or chunk_index == -1:
+                return [chunk]
+            retriever = self._get_dense_retriever()
+            if retriever is None or not hasattr(retriever, "get_surrounding_chunks"):
+                return [chunk]
+            collection = legacy_to_qdrant_name(
+                self.storage_config.get("text_table_name", "")
+            )
+            try:
+                rows = retriever.get_surrounding_chunks(
+                    collection, document_id, int(chunk_index), window_size
+                )
+            except Exception as e:
+                print(f"⚠️  Qdrant surrounding-chunks failed: {e}")
+                return [chunk]
+            return rows or [chunk]
+
+        # ------------------------------------------------------------------
+        # LanceDB legacy path (unchanged)
+        # ------------------------------------------------------------------
         db_manager = self._get_db_manager()
         if not db_manager:
             return [chunk]
@@ -557,6 +618,35 @@ ORIGINAL QUESTION: "{query}"
         perfect recall. If anything goes wrong we return an empty list so
         the caller can degrade gracefully.
         """
+        # ------------------------------------------------------------------
+        # Qdrant: scroll a small page and dedup document_ids
+        # ------------------------------------------------------------------
+        if self.vector_backend == "qdrant":
+            try:
+                from qdrant_client import models as qm
+
+                coll = legacy_to_qdrant_name(self.storage_config.get("text_table_name", ""))
+                manager = self._get_db_manager()
+                if not coll or not isinstance(manager, QdrantManager) or not manager.has_collection(coll):
+                    return []
+                points, _ = manager.client.scroll(
+                    collection_name=coll,
+                    with_payload=True,
+                    with_vectors=False,
+                    limit=max_items * 16,
+                )
+                seen, titles = set(), []
+                for p in points:
+                    did = (p.payload or {}).get("document_id")
+                    if did and did not in seen:
+                        seen.add(did)
+                        titles.append(did)
+                        if len(titles) >= max_items:
+                            break
+                return titles
+            except Exception:
+                return []
+
         try:
             tbl_name = self.storage_config.get("text_table_name")
             if not tbl_name:

@@ -1,3 +1,61 @@
+# LocalGPT — Vahe CLP-eval patches (v2 + v3 + Qdrant migration)
+
+## v7 — Qdrant vector backend + DOCX ingestion + automated CLP rubric
+
+Branch: `experiment/qdrant-vector-db`
+
+### What changed
+
+1. **Pluggable vector backend.** New `rag_system/vectorstore/` package with:
+   - `qdrant_store.py` — `QdrantManager` + `QdrantVectorIndexer` (drop-in
+     replacement for `LanceDBManager` / `VectorIndexer`).
+   - `qdrant_retriever.py` — `QdrantMultiVectorRetriever` matching the legacy
+     LanceDB retriever's API (same chunk-dict shape; hybrid vec+BM25; per-user
+     filter).
+   - `bm25_sidecar.py` — per-collection `BM25Okapi` index with citation-aware
+     tokeniser; replaces LanceDB native FTS lost in the migration.
+   - `__init__.py` — collection-name helpers and `legacy_to_qdrant_name()` so
+     existing `db.indexes.vector_table_name = text_pages_<idx_id>` rows keep
+     working unchanged (translated to `kb_<idx_id>` at retrieval time).
+2. **Backend selector.** `PIPELINE_CONFIGS["default"]["vector_backend"]` is now
+   `"qdrant"` (override with `VECTOR_BACKEND=lancedb` to fall back). Both the
+   `IndexingPipeline` and `RetrievalPipeline` branch on this flag; LanceDB code
+   paths are left intact for an easy rollback.
+3. **Embedded mode.** Qdrant runs in-process via `QdrantClient(path=…)` — no
+   Docker, no separate daemon. Data lives at `./qdrant_data/`.
+4. **DOCX support.** `rag_system/ingestion/pdf_converter.py` now routes by file
+   extension. PDFs use the existing docling+OcrMacOptions converter; DOCX files
+   go through a docling DOCX pipeline. OCR auto-engages only on PDFs whose
+   text-layer probe returns empty.
+5. **Per-knowledge-base isolation.** Collections are named `kb_<idx_id>` and
+   `kb_<idx_id>_lc`. The indexer also writes a `user_id` payload field so the
+   retriever can apply a defence-in-depth `must` filter on top of the
+   collection boundary.
+6. **Surrounding-chunks window.** `RetrievalPipeline._get_surrounding_chunks_lancedb`
+   now dispatches by backend; the Qdrant path uses a payload-filtered scroll on
+   `document_id + chunk_index range`.
+7. **Index deletion.** `database.delete_index` cleans up the Qdrant collection
+   AND its BM25 sidecar in addition to the legacy LanceDB drop.
+8. **CLP-derivative automated eval.** New `evaluation/clp_rubric.py` + `clp_eval.py`.
+   12-check rubric (citations + correct conclusion + grounding + KB-gap flag +
+   inline `[S#]` citations + 9th-circuit hook). Plus 5 secondary stress-test
+   questions across TPS / CLP / EAD topics. Runs end-to-end:
+   ```bash
+   python -m evaluation.clp_eval --corpus eval_corpus --kb-id clp_eval_001 --reindex
+   ```
+   Saves a JSON report to `evaluation/results/`.
+
+### Migration notes
+
+- Existing LanceDB tables (`./lancedb/text_pages_<uuid>.lance`) are NOT migrated.
+  Re-index any pre-existing knowledge bases against the Qdrant backend, or set
+  `VECTOR_BACKEND=lancedb` to keep using them.
+- Embedded Qdrant takes an exclusive file lock on `./qdrant_data`. Don't open
+  two pipelines against it concurrently; the eval harness uses one long-lived
+  `RetrievalPipeline` for all queries.
+
+---
+
 # LocalGPT — Vahe CLP-eval patches (v2 + v3)
 
 This `localgpt-v2` working tree carries patches applied during a two-session

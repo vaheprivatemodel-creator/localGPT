@@ -48,9 +48,15 @@ EXTERNAL_MODELS = {
 PIPELINE_CONFIGS = {
     "default": {
         "description": "Production-ready pipeline with hybrid search, AI reranking, and verification",
+        # 🆕 Vector backend selector. "qdrant" (default on this branch) routes
+        # through rag_system.vectorstore.* with per-knowledge-base collections
+        # named ``kb_<idx_id>``. "lancedb" keeps the legacy LanceDB path so we
+        # can fall back if anything regresses during the migration.
+        "vector_backend": os.getenv("VECTOR_BACKEND", "qdrant"),
         "storage": {
             "lancedb_uri": "./lancedb",
-            "text_table_name": "text_pages_v3", 
+            "qdrant_path": os.getenv("QDRANT_PATH", "./qdrant_data"),
+            "text_table_name": "text_pages_v3",
             "image_table_name": "image_pages_v3",
             "bm25_path": "./index_store/bm25",
             "graph_path": "./index_store/graph/knowledge_graph.gml"
@@ -111,10 +117,12 @@ PIPELINE_CONFIGS = {
     },
     "fast": {
         "description": "Speed-optimized pipeline with minimal overhead",
+        "vector_backend": os.getenv("VECTOR_BACKEND", "qdrant"),
         "storage": {
             "lancedb_uri": "./lancedb",
+            "qdrant_path": os.getenv("QDRANT_PATH", "./qdrant_data"),
             "text_table_name": "text_pages_v3",
-            "image_table_name": "image_pages_v3", 
+            "image_table_name": "image_pages_v3",
             "bm25_path": "./index_store/bm25"
         },
         "retrieval": {
