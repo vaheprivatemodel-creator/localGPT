@@ -254,10 +254,13 @@ def main() -> int:
         from rag_system.vectorstore.bm25_sidecar import Bm25Sidecar
 
         coll = cfg["storage"]["text_table_name"]
-        # Embedded Qdrant holds an exclusive file lock; scope this client tightly
-        # so the IndexingPipeline can open its own client moments later.
-        with QdrantManager(path=args.qdrant_path) as manager:
+        # Embedded Qdrant holds an exclusive file lock; close explicitly so
+        # the IndexingPipeline can open (or re-share) the client moments later.
+        manager = QdrantManager(path=args.qdrant_path)
+        try:
             manager.delete_collection(coll)
+        finally:
+            manager.close()
         bm25_dir = cfg["storage"].get("bm25_path", "./index_store/bm25")
         Bm25Sidecar(bm25_dir).delete(coll)
         files = _collect_documents(corpus_dir)

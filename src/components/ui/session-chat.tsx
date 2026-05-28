@@ -50,7 +50,7 @@ export const SessionChat = forwardRef<SessionChatRef, SessionChatProps>(({
   const [enableStream, setEnableStream] = useState<boolean>(true)
   const [enableVerify, setEnableVerify] = useState<boolean>(true)
   // Force RAG toggle
-  const [forceDocs, setForceDocs] = useState<boolean>(false)
+  const [forceDocs, setForceDocs] = useState<boolean>(true)
   // Provence pruning toggle
   const [provencePrune, setProvencePrune] = useState<boolean>(false)
   
@@ -240,7 +240,10 @@ export const SessionChat = forwardRef<SessionChatRef, SessionChatProps>(({
           {
             query: content,
             session_id: activeSessionId,
-            table_name: idxId ? `text_pages_${idxId}` : undefined,
+            // Intentionally omit `table_name` here — the rag-api resolves the
+            // correct Qdrant collection from the session's linked index in the
+            // DB. Sending `text_pages_<idxId>` produced a non-existent
+            // collection and resulted in empty retrieval.
             composeSubAnswers,
             decompose: enableDecompose,
             aiRerank: enableAiRerank,
@@ -458,10 +461,33 @@ export const SessionChat = forwardRef<SessionChatRef, SessionChatProps>(({
                 ];
                 return { ...m, content: { steps: stepsDir } };
               }
+              if (evt.type === 'error') {
+                const errMsg = (evt.data && (evt.data.error || evt.data.message)) || 'Unknown server error';
+                console.error('STREAM ERROR:', errMsg);
+                const finalIdx = steps.findIndex(s => s.key === 'final' || s.key === 'direct');
+                if (finalIdx !== -1) {
+                  steps[finalIdx].status = 'done';
+                  steps[finalIdx].details = { answer: `Error from server: ${errMsg}`, source_documents: [] };
+                }
+                steps.forEach(s => { if (s.status !== 'done') s.status = 'done'; });
+                setIsLoading(false);
+                return { ...m, content: { steps }, metadata: { message_type: 'complete' } };
+              }
               return m;
             }));
           }
         )
+        // Safety: even if the server closed the stream without sending a
+        // `complete` event (proxy buffering, network blip, exception …),
+        // make sure the UI is not stuck in the loading state.
+        setIsLoading(false);
+        setMessages(prev => prev.map(m => {
+          if (m.metadata?.message_type !== 'in_progress') return m;
+          const stepsRef = (m.content as any)?.steps as Step[] | undefined;
+          if (!stepsRef) return m;
+          const steps = stepsRef.map(s => s.status === 'pending' ? { ...s, status: 'done' as const } : s);
+          return { ...m, content: { steps }, metadata: { message_type: 'complete' } };
+        }));
       } else {
         const response = await apiService.sendSessionMessage(activeSessionId, content, { 
           composeSubAnswers, 

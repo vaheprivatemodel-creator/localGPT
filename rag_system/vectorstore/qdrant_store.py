@@ -47,12 +47,40 @@ class QdrantManager:
     Mirrors the role ``LanceDBManager`` plays for the LanceDB backend so call
     sites that previously held a ``LanceDBManager`` can be re-pointed without
     rewriting their flow.
+
+    Embedded ``QdrantClient(path=...)`` holds an exclusive file lock on its
+    data directory, so within a single process we MUST share one client per
+    path. This class implements a per-path singleton: any two calls with the
+    same resolved path get back the same underlying client/instance, which
+    prevents the "Storage folder is already accessed by another instance of
+    Qdrant client" error when multiple pipelines (indexing + retrieval)
+    instantiate their own manager.
     """
 
+    # path -> QdrantManager instance
+    _instances: dict[str, "QdrantManager"] = {}
+    _disable_singleton: bool = False  # tests can flip if needed
+
+    def __new__(cls, path: str):
+        full = os.path.abspath(path)
+        if not cls._disable_singleton:
+            existing = cls._instances.get(full)
+            if existing is not None and getattr(existing, "client", None) is not None:
+                return existing
+        return super().__new__(cls)
+
     def __init__(self, path: str):
-        self.path = os.path.abspath(path)
+        full = os.path.abspath(path)
+        # If this is the cached singleton, __init__ may be called again on the
+        # already-initialised instance — short-circuit to avoid reopening the
+        # client (which would deadlock on the file lock).
+        if getattr(self, "_initialised", False) and self.path == full:
+            return
+        self.path = full
         os.makedirs(self.path, exist_ok=True)
         self.client = QdrantClient(path=self.path)
+        self._initialised = True
+        QdrantManager._instances[full] = self
         print(f"Qdrant (embedded) opened at: {self.path}")
 
     def close(self) -> None:
@@ -67,12 +95,21 @@ class QdrantManager:
             self.client.close()
         except Exception:
             pass
+        # Forget the singleton so a subsequent constructor call gets a fresh
+        # client. Callers that ``close()`` mid-run accept that they must
+        # rebuild any retriever depending on the old client.
+        self._initialised = False
+        QdrantManager._instances.pop(self.path, None)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        self.close()
+        # Do NOT auto-close on context exit: this instance may be shared with
+        # other pipelines. Closing here would yank the lock out from under
+        # them. The eval harness, which IS sure it is the sole owner, calls
+        # close() explicitly.
+        return False
 
     # ------------------------------------------------------------------
     # Collection lifecycle

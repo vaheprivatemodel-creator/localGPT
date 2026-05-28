@@ -246,6 +246,7 @@ class ChatAPI {
     try {
       const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}`, {
         method: 'DELETE',
+        headers: authHeaders(),
       });
 
       if (!response.ok) {
@@ -308,6 +309,7 @@ class ChatAPI {
 
       const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/upload`, {
         method: 'POST',
+        headers: authHeaders(),
         body: formData,
       });
 
@@ -378,6 +380,7 @@ class ChatAPI {
       
       const response = await fetch(`${API_BASE_URL}/sessions/${sessionId}/upload`, {
         method: 'POST',
+        headers: authHeaders(),
         body: formData,
       });
 
@@ -421,7 +424,9 @@ class ChatAPI {
 
   // ---------------- Models ----------------
   async getModels(): Promise<ModelsResponse> {
-    const resp = await fetch(`${API_BASE_URL}/models`);
+    const resp = await fetch(`${API_BASE_URL}/models`, {
+      headers: authHeaders(),
+    });
     if (!resp.ok) {
       throw new Error(`Failed to fetch models list: ${resp.status}`);
     }
@@ -429,7 +434,9 @@ class ChatAPI {
   }
 
   async getSessionDocuments(sessionId: string): Promise<{ files: string[]; file_count: number; session: ChatSession }> {
-    const resp = await fetch(`${API_BASE_URL}/sessions/${sessionId}/documents`);
+    const resp = await fetch(`${API_BASE_URL}/sessions/${sessionId}/documents`, {
+      headers: authHeaders(),
+    });
     if (!resp.ok) {
       throw new Error(`Failed to fetch session documents: ${resp.status}`);
     }
@@ -454,7 +461,11 @@ class ChatAPI {
   async uploadFilesToIndex(indexId: string, files: File[]): Promise<{ message: string; uploaded_files: any[] }> {
     const fd = new FormData();
     files.forEach((f) => fd.append('files', f, f.name));
-    const resp = await fetch(`${API_BASE_URL}/indexes/${indexId}/upload`, { method: 'POST', body: fd });
+    const resp = await fetch(`${API_BASE_URL}/indexes/${indexId}/upload`, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: fd,
+    });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(`Upload to index error: ${err.error || resp.statusText}`);
@@ -509,7 +520,10 @@ class ChatAPI {
   }
 
   async linkIndexToSession(sessionId: string, indexId: string): Promise<{ message: string }> {
-    const resp = await fetch(`${API_BASE_URL}/sessions/${sessionId}/indexes/${indexId}`, { method: 'POST' });
+    const resp = await fetch(`${API_BASE_URL}/sessions/${sessionId}/indexes/${indexId}`, {
+      method: 'POST',
+      headers: authHeaders(),
+    });
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(`Link index error: ${err.error || resp.statusText}`);

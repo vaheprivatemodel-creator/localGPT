@@ -34,6 +34,87 @@ if RAG_AGENT is None:
     print("❌ Critical error: RAG Agent could not be initialized. Exiting.")
     exit(1)
 print("✅ RAG Agent initialized successfully with MAXIMUM ACCURACY.")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Pre-warm pass — pure latency optimisation, zero accuracy impact.
+#
+# Lazy initialisation otherwise makes the FIRST user query pay for:
+#   • Ollama loading qwen2.5:14b   (~9 GB → ~10–15 s)
+#   • Ollama loading qwen3:0.6b    (triage / direct_answer  ~2–3 s)
+#   • Ollama loading nomic-embed   (~0.3 GB → ~1–2 s)
+#   • HF loading the ColBERT rerank model into MPS (~10–20 s)
+#   • HF loading the dense text embedder (~1–3 s)
+#
+# We do all of those once here so the first real question runs warm.
+# Skip with PREWARM_RAG=0 if you want the old lazy behaviour.
+# ─────────────────────────────────────────────────────────────────────
+def _prewarm_rag() -> None:
+    import time as _t
+    t0 = _t.time()
+    print("🔥 Pre-warming RAG components (latency optimisation)...")
+
+    pipeline = getattr(RAG_AGENT, "retrieval_pipeline", None)
+    ollama_cfg = getattr(RAG_AGENT, "ollama_config", {}) or {}
+
+    # 1) Dense text embedder — loads the HF / Ollama embedding weights.
+    try:
+        emb = pipeline._get_text_embedder() if pipeline else None
+        if emb is not None:
+            emb.create_embeddings(["warmup"])
+            print(f"   ✅ text embedder warm ({_t.time()-t0:.1f}s)")
+    except Exception as e:
+        print(f"   ⚠️  text embedder warmup skipped: {e}")
+
+    # 2) Ollama models — one tiny generate per model with keep_alive=24h
+    #    so the weights stay resident in VRAM between requests.
+    try:
+        ollama_host = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+        candidate_models = {
+            ollama_cfg.get("generation_model"),
+            ollama_cfg.get("triage_model"),
+            ollama_cfg.get("enrichment_model"),
+            ollama_cfg.get("embedding_model"),
+        }
+        for model in [m for m in candidate_models if m]:
+            try:
+                requests.post(
+                    f"{ollama_host}/api/generate",
+                    json={
+                        "model": model,
+                        "prompt": "warmup",
+                        "stream": False,
+                        "keep_alive": "24h",
+                        "options": {"num_predict": 1},
+                    },
+                    timeout=120,
+                )
+                print(f"   ✅ ollama '{model}' warm + keep_alive=24h ({_t.time()-t0:.1f}s)")
+            except Exception as e:
+                print(f"   ⚠️  ollama '{model}' warmup failed: {e}")
+    except Exception as e:
+        print(f"   ⚠️  ollama warmup skipped: {e}")
+
+    # 3) ColBERT reranker — loads model into MPS.
+    try:
+        rr = pipeline._get_ai_reranker() if pipeline else None
+        if rr is not None:
+            try:
+                rr.rank(query="warmup", docs=["warmup document"])
+            except TypeError:
+                rr.rank("warmup", ["warmup document"])
+            print(f"   ✅ ColBERT reranker warm ({_t.time()-t0:.1f}s)")
+    except Exception as e:
+        print(f"   ⚠️  ColBERT reranker warmup skipped: {e}")
+
+    print(f"🔥 Pre-warm complete in {_t.time()-t0:.1f}s — first user query will now run warm.")
+
+
+if os.getenv("PREWARM_RAG", "1") != "0":
+    try:
+        _prewarm_rag()
+    except Exception as _e:
+        print(f"⚠️  Pre-warm pass crashed (continuing anyway): {_e}")
 # ---
 
 # Add helper near top after db & agent init
@@ -171,11 +252,17 @@ class AdvancedRagApiHandler(http.server.BaseHTTPRequestHandler):
             provence_prune = data.get('provence_prune')
             provence_threshold = data.get('provence_threshold')
             
-            # User-selected generation model
+            # User-selected generation model — always coerce to canonical default
+            # if the client did not pin one, so a stale per-request override can
+            # never quietly downgrade us to a weaker model.
+            DEFAULT_GEN_MODEL = os.getenv("DEFAULT_GEN_MODEL", "qwen2.5:14b")
             requested_model = data.get('model')
-            if isinstance(requested_model,str) and requested_model:
-                RAG_AGENT.ollama_config['generation_model']=requested_model
-            
+            if isinstance(requested_model, str) and requested_model.strip():
+                RAG_AGENT.ollama_config['generation_model'] = requested_model.strip()
+            else:
+                RAG_AGENT.ollama_config['generation_model'] = DEFAULT_GEN_MODEL
+            print(f"🤖 Generation model for this request: {RAG_AGENT.ollama_config['generation_model']}")
+
             if not query:
                 self.send_json_response({"error": "Query is required"}, status_code=400)
                 return
@@ -210,10 +297,14 @@ class AdvancedRagApiHandler(http.server.BaseHTTPRequestHandler):
                     print(f"⚠️ Failed to update session title or store user message: {e}")
                     # Continue with the request even if title update fails
 
-            # Allow explicit table_name override
-            table_name = data.get('table_name')
-            if not table_name and session_id:
-                table_name = _get_table_name_for_session(session_id)
+            # Resolve vector collection: ALWAYS prefer the session's linked
+            # index, because the front-end historically sends a legacy
+            # `text_pages_<index_id>` shim that does not correspond to a real
+            # Qdrant collection name. Trust the DB.
+            session_table = _get_table_name_for_session(session_id) if session_id else None
+            explicit_table = data.get('table_name')
+            table_name = session_table or explicit_table
+            print(f"📦 table_name → {table_name} (session={session_table}, explicit={explicit_table})")
 
             # Decide execution path
             print(f"🔧 Force RAG flag: {force_rag}")
@@ -330,10 +421,16 @@ class AdvancedRagApiHandler(http.server.BaseHTTPRequestHandler):
             provence_prune = data.get('provence_prune')
             provence_threshold = data.get('provence_threshold')
 
-            # User-selected generation model
+            # User-selected generation model — always coerce to canonical default
+            # if the client did not pin one, so a stale per-request override can
+            # never quietly downgrade us to a weaker model.
+            DEFAULT_GEN_MODEL = os.getenv("DEFAULT_GEN_MODEL", "qwen2.5:14b")
             requested_model = data.get('model')
-            if isinstance(requested_model,str) and requested_model:
-                RAG_AGENT.ollama_config['generation_model']=requested_model
+            if isinstance(requested_model, str) and requested_model.strip():
+                RAG_AGENT.ollama_config['generation_model'] = requested_model.strip()
+            else:
+                RAG_AGENT.ollama_config['generation_model'] = DEFAULT_GEN_MODEL
+            print(f"🤖 [stream] Generation model: {RAG_AGENT.ollama_config['generation_model']}")
 
             if not query:
                 self.send_json_response({"error": "Query is required"}, status_code=400)
@@ -369,10 +466,14 @@ class AdvancedRagApiHandler(http.server.BaseHTTPRequestHandler):
                     print(f"⚠️ Failed to update session title or store user message: {e}")
                     # Continue with the request even if title update fails
 
-            # Allow explicit table_name override
-            table_name = data.get('table_name')
-            if not table_name and session_id:
-                table_name = _get_table_name_for_session(session_id)
+            # Resolve vector collection: ALWAYS prefer the session's linked
+            # index, because the front-end historically sends a legacy
+            # `text_pages_<index_id>` shim that does not correspond to a real
+            # Qdrant collection name. Trust the DB.
+            session_table = _get_table_name_for_session(session_id) if session_id else None
+            explicit_table = data.get('table_name')
+            table_name = session_table or explicit_table
+            print(f"📦 [stream] table_name → {table_name} (session={session_table}, explicit={explicit_table})")
 
             # Prepare response headers for SSE
             self.send_response(200)
