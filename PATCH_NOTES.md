@@ -1,5 +1,57 @@
 # LocalGPT — Vahe CLP-eval patches (v2 + v3 + Qdrant migration)
 
+## v9 — TTFT speedups (branch `speedup/ttft`)
+
+**Goal:** cut the time the user waits from clicking "Send" to seeing the first answer token, **without touching answer accuracy**.
+
+### Changes
+
+1. **`hello` SSE flush** (`rag_system/api_server.py`, `src/components/ui/session-chat.tsx`)
+   - The moment `/chat/stream` accepts a request, the rag-api writes a tiny `data: {"type":"hello",...}` event and flushes. The browser's stream reader unblocks within ~ms; the UI lights up the first pipeline step ("Analyzing your question…") immediately.
+   - Pure UX/perception change. Zero retrieval/LLM impact.
+
+2. **Sentence-level chunk dedup** (`rag_system/vectorstore/qdrant_retriever.py`)
+   - `_dedup_repeated_sentences()` removes any **sentence ≥80 chars** whose whitespace-normalised form appeared earlier in the same chunk.
+   - Targets docling's two-pass extractor artifact (same paragraph emitted twice in one chunk with different whitespace). Verified safe on 4 cases: legit text → unchanged, real duplication → 48 % shrink, short citations → preserved, env bypass works.
+   - Applied to vector hits, BM25-only hits, and `get_surrounding_chunks` (context expansion).
+   - Env override: `RAG_DEDUP_CHUNKS=0` to A/B test.
+
+3. **Ollama tuning** (`~/Library/LaunchAgents/homebrew.mxcl.ollama.plist`)
+   - `OLLAMA_NUM_PARALLEL` 2 → **1** — for single-user use, parallel=2 splits the KV cache, hurting prompt-eval speed.
+   - `OLLAMA_NUM_THREAD` 10 → **12** — use all 12 perf cores of the M2 Max.
+   - Defensive `X-Accel-Buffering: no` SSE header.
+
+### Not changed (deliberately)
+
+- **No speculative decoding** — Ollama 0.22.1 silently ignores the `draft_model` param (verified by probe). Switching to `llama-server` would be a multi-hour rewrite; held off.
+- **No `reranker_top_k` change** — small but non-zero accuracy risk; chose to stay at 10 for now.
+- **No `context_window_size` change** — medium accuracy risk; left at 1.
+
+### Measured results — UI-path test (`evaluation/ui_path_test.py`), CLP-derivative question, qwen2.5:14b
+
+| Metric | Baseline (pre-speedup) | Speedup branch | Δ |
+| --- | --- | --- | --- |
+| **First byte** (any SSE event arrives at browser) | 0.25 s | **0.01 s** | **‑96 %** |
+| **TTFT** (first answer token) | 60.99 s | **46.42 s median**<br>(24.41 / 46.42 / 53.21 s across 3 timed runs) | **‑24 %** (‑14.6 s) |
+| **Total** (full streamed answer) | 74.2 s | **62.9 s median** (37.6 – 68.9 s) | **‑15 %** (‑11.3 s) |
+| **Rubric score** | 5/6 | 5/6 (one run hit 6/6) | unchanged |
+| **Answer length** | 1602 chars | 1572–1983 chars | similar / slightly more verbose |
+| **Sources cited** | 8 | 7–8 | unchanged |
+
+#### Dedup isolation run (`RAG_DEDUP_CHUNKS=0`)
+| | dedup OFF | dedup ON |
+| --- | --- | --- |
+| TTFT | 57.5 s | 46.4 s |
+| Total | 73.5 s | 62.9 s |
+| Score | 5/6 | 5/6 |
+
+→ **Dedup alone is worth ~11 s of TTFT.** The rest comes from Ollama tuning + prefix-cache reuse.
+
+#### Perceived responsiveness
+The `hello` flush is the single biggest UX win: the browser's spinner / step indicator animates within ~30 ms instead of 250 ms, so the user sees the system "react" the instant they click Send, even though the LLM is still working on prompt eval underneath.
+
+---
+
 ## v7 — Qdrant vector backend + DOCX ingestion + automated CLP rubric
 
 Branch: `experiment/qdrant-vector-db`

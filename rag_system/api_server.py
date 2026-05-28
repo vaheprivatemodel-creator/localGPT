@@ -1,6 +1,7 @@
 import json
 import http.server
 import socketserver
+import time
 from urllib.parse import urlparse, parse_qs
 import os
 import requests
@@ -482,6 +483,10 @@ class AdvancedRagApiHandler(http.server.BaseHTTPRequestHandler):
             # Keep connection alive for SSE; no manual chunked encoding (Python http.server
             # does not add chunk sizes automatically, so declaring it breaks clients).
             self.send_header('Connection', 'keep-alive')
+            # X-Accel-Buffering disables proxy-level buffering (nginx, etc.) — defensive
+            # for setups where the rag-api sits behind something other than our own
+            # native Next.js route handler.
+            self.send_header('X-Accel-Buffering', 'no')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
 
@@ -494,6 +499,16 @@ class AdvancedRagApiHandler(http.server.BaseHTTPRequestHandler):
                 except BrokenPipeError:
                     # Client disconnected
                     raise
+
+            # ──────────────────────────────────────────────────────────────
+            # TTFT trick: emit a `hello` event immediately so the browser's
+            # streaming reader unblocks within ~ms instead of having to wait
+            # for retrieval/rerank/LLM to produce the first real event. The
+            # UI shows this as "thinking" state activating instantly, which
+            # massively improves *perceived* responsiveness without changing
+            # the answer or its timing.
+            # ──────────────────────────────────────────────────────────────
+            emit("hello", {"ts": time.time(), "model": RAG_AGENT.ollama_config.get("generation_model")})
 
             # Run the agent synchronously, emitting checkpoints
             try:

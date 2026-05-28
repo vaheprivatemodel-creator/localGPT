@@ -123,6 +123,9 @@ def stream_chat(token: str, sid: str) -> dict[str, Any]:
     sources: list[Any] = []
     last_evt = None
     err: str | None = None
+    ttft_first_event: float | None = None       # any byte from server
+    ttft_first_token: float | None = None       # first actual answer token (content streaming)
+    ttft_first_sub_token: float | None = None   # first sub-query token (also useful for UX)
     with requests.post(f"{UI}/api/stream", headers={**auth(token),
                                                     "Content-Type": "application/json",
                                                     "Accept": "text/event-stream"},
@@ -142,18 +145,28 @@ def stream_chat(token: str, sid: str) -> dict[str, Any]:
             etype = evt.get("type")
             last_evt = etype
             now = time.time() - t0
+            if ttft_first_event is None:
+                ttft_first_event = now
+                print(f"   {now:6.2f}s  ⚡ FIRST BYTE  (type={etype})")
             if etype in ("analyze", "decomposition", "retrieval_started",
                          "retrieval_done", "rerank_started", "rerank_done",
                          "context_expand_started", "context_expand_done",
-                         "final_answer", "single_query_result"):
+                         "final_answer", "single_query_result", "hello"):
                 stages.append((etype, now))
                 print(f"   {now:6.2f}s  ▸ {etype}")
             elif etype == "token":
                 tok = (evt.get("data") or {}).get("text") or ""
+                if ttft_first_token is None and tok:
+                    ttft_first_token = now
+                    print(f"   {now:6.2f}s  🎯 TTFT (first answer token)")
                 answer += tok
-                # progress dots
                 if len(answer) % 200 < len(tok):
                     print(f"   {now:6.2f}s  📝 streamed {len(answer)} chars")
+            elif etype == "sub_query_token":
+                tok = (evt.get("data") or {}).get("text") or ""
+                if ttft_first_sub_token is None and tok:
+                    ttft_first_sub_token = now
+                    print(f"   {now:6.2f}s  🎯 first sub-query token")
             elif etype == "sub_query_result":
                 stages.append(("sub_query_result", now))
                 sub = evt.get("data") or {}
@@ -173,7 +186,10 @@ def stream_chat(token: str, sid: str) -> dict[str, Any]:
             else:
                 stages.append((etype, now))
     return {"answer": answer, "sources": sources, "stages": stages,
-            "total_s": time.time() - t0, "error": err, "last": last_evt}
+            "total_s": time.time() - t0, "error": err, "last": last_evt,
+            "ttft_first_event": ttft_first_event,
+            "ttft_first_token": ttft_first_token,
+            "ttft_first_sub_token": ttft_first_sub_token}
 
 
 def grade(answer: str, sources: list[Any]) -> dict[str, Any]:
@@ -213,10 +229,16 @@ def main():
     print("\n" + "=" * 72)
     print("RESULT")
     print("=" * 72)
-    print(f"total_time    : {result['total_s']:.1f}s")
-    print(f"last_event    : {result['last']}")
-    print(f"answer_len    : {len(result['answer'])} chars")
-    print(f"num_sources   : {len(result['sources'])}")
+    fe  = result.get('ttft_first_event')
+    fst = result.get('ttft_first_sub_token')
+    ft  = result.get('ttft_first_token')
+    print(f"ttft_first_byte (any SSE event)   : {f'{fe:.2f}s' if fe is not None else 'n/a'}")
+    print(f"ttft_first_sub_token              : {f'{fst:.2f}s' if fst is not None else 'n/a'}")
+    print(f"ttft_first_answer_token (TTFT★)   : {f'{ft:.2f}s' if ft is not None else 'n/a'}")
+    print(f"total_time                        : {result['total_s']:.1f}s")
+    print(f"last_event                        : {result['last']}")
+    print(f"answer_len                        : {len(result['answer'])} chars")
+    print(f"num_sources                       : {len(result['sources'])}")
     if result["error"]:
         print(f"error         : {result['error']}")
 

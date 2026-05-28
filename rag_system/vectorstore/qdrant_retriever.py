@@ -21,6 +21,8 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import logging
+import os
+import re
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +42,59 @@ def _normalise(values: List[float]) -> List[float]:
     if hi - lo < 1e-9:
         return [0.5 for _ in values]
     return [(v - lo) / (hi - lo) for v in values]
+
+
+# ---------------------------------------------------------------------------
+# Chunk text post-processing — safe dedup of docling's two-pass duplication
+# ---------------------------------------------------------------------------
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_WS = re.compile(r"\s+")
+
+
+def _norm(s: str) -> str:
+    return _WS.sub(" ", s).lower().strip()
+
+
+def _dedup_repeated_sentences(text: str, min_len: int = 80) -> str:
+    """Remove second+ occurrences of any sentence ≥``min_len`` chars whose
+    whitespace-normalised form was seen earlier in the same chunk.
+
+    Why: docling's two-pass extractor sometimes emits the same long paragraph
+    twice in a row inside one chunk (once with original layout, once with
+    flattened whitespace). The LLM then has to read both copies — pure
+    prompt-eval cost with zero new information.
+
+    Safety:
+    - Only sentences ≥``min_len`` chars are considered for dedup, so short
+      legal citations like "INA § 208(b)(1)(B)(i)" that legitimately repeat
+      are never touched.
+    - Comparison is whitespace-normalised but case-sensitive after lower()
+      — a paraphrase or a sentence with even a single different word is kept.
+    - If no duplicates are found, the input is returned verbatim (no
+      whitespace mangling).
+    - Disable globally with env ``RAG_DEDUP_CHUNKS=0`` for A/B testing.
+    """
+    if not text or os.getenv("RAG_DEDUP_CHUNKS", "1") == "0":
+        return text
+    sentences = _SENT_SPLIT.split(text)
+    if len(sentences) < 2:
+        return text
+    seen: set[str] = set()
+    keep: List[str] = []
+    dropped = 0
+    for s in sentences:
+        if len(s) < min_len:
+            keep.append(s)
+            continue
+        n = _norm(s)
+        if n in seen:
+            dropped += 1
+            continue
+        seen.add(n)
+        keep.append(s)
+    if dropped == 0:
+        return text  # preserve original verbatim when there's nothing to gain
+    return " ".join(keep)
 
 
 class QdrantMultiVectorRetriever:
@@ -121,10 +176,11 @@ class QdrantMultiVectorRetriever:
             # Qdrant cosine score: higher = better, in [0,1]
             vec_score = float(getattr(hit, "score", 0.0) or 0.0)
             cosine_distance = max(0.0, 1.0 - vec_score)
+            raw_text = metadata.get("original_text", payload.get("text", ""))
             results.append(
                 {
                     "chunk_id": payload.get("chunk_id"),
-                    "text": metadata.get("original_text", payload.get("text", "")),
+                    "text": _dedup_repeated_sentences(raw_text),
                     "_distance": cosine_distance,
                     "vec_score": vec_score,
                     "document_id": payload.get("document_id"),
@@ -189,6 +245,12 @@ class QdrantMultiVectorRetriever:
             entry["vec_score_norm"] = s
         for h, s in zip(bm25_hits, bm25_scores):
             cid = h.get("chunk_id") or json.dumps(h, sort_keys=True, default=str)
+            # BM25 sidecar hits may carry an undeduped text field; apply the
+            # same safe sentence-level dedup so the LLM never sees the docling
+            # two-pass duplication regardless of which retrieval leg surfaced
+            # the chunk first.
+            if "text" in h and isinstance(h["text"], str):
+                h = {**h, "text": _dedup_repeated_sentences(h["text"])}
             entry = merged.setdefault(cid, {**h, "score": 0.0, "_distance": None})
             entry["score"] += w_bm25 * s
             entry["bm25"] = h.get("bm25")
@@ -228,4 +290,7 @@ class QdrantMultiVectorRetriever:
 
         rows = self.manager.scroll_by_filter(collection, payload_filter, limit=window_size * 4 + 4)
         rows.sort(key=lambda r: r.get("chunk_index", 0))
+        for row in rows:
+            if isinstance(row.get("text"), str):
+                row["text"] = _dedup_repeated_sentences(row["text"])
         return rows

@@ -263,6 +263,16 @@ export const SessionChat = forwardRef<SessionChatRef, SessionChatProps>(({
             setMessages(prev => prev.map(m => {
               if (m.id !== placeholder.id) return m;
               const steps = [...(m.content as any).steps];
+              if (evt.type === 'hello') {
+                // Instant visual feedback: server accepted the request and
+                // is about to start retrieval. Light up the first stage so
+                // the user sees the pipeline animate within ~ms of sending.
+                if (steps[0].status === 'pending') {
+                  steps[0].status = 'active';
+                  steps[0].details = 'Analyzing your question…';
+                }
+                return { ...m, content: { steps } };
+              }
               if (evt.type === 'analyze') {
                 steps[0].status = 'active';
                 steps[0].details = 'Analyzing your question...';
