@@ -7,6 +7,27 @@ function authHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Global 401 handler — if the backend ever returns 401 (token expired,
+// backend restart wiped auth_tokens table, etc.) we drop the local
+// token and bounce to /login. Prevents the "Failed to list X: 401"
+// dead-end where the user is technically logged in client-side but the
+// server doesn't recognise them.
+// ──────────────────────────────────────────────────────────────────────
+function handleAuthExpired(resp: Response): boolean {
+  if (resp.status !== 401) return false;
+  if (typeof window === 'undefined') return false;
+  try {
+    localStorage.removeItem('auth_token');
+    localStorage.removeItem('auth_user');
+  } catch { /* ignore */ }
+  // Avoid infinite redirect loops if we're already on /login
+  if (window.location.pathname !== '/login') {
+    window.location.assign('/login');
+  }
+  return true;
+}
+
 // 🆕 Simple UUID generator for client-side message IDs
 export const generateUUID = () => {
   if (typeof window !== 'undefined' && window.crypto && window.crypto.randomUUID) {
@@ -142,6 +163,7 @@ class ChatAPI {
       const response = await fetch(`${API_BASE_URL}/sessions`, {
         headers: authHeaders(),
       });
+      if (handleAuthExpired(response)) throw new Error('Session expired — redirecting to login');
       if (!response.ok) {
         throw new Error(`Failed to get sessions: ${response.status}`);
       }
@@ -427,6 +449,7 @@ class ChatAPI {
     const resp = await fetch(`${API_BASE_URL}/models`, {
       headers: authHeaders(),
     });
+    if (handleAuthExpired(resp)) throw new Error('Session expired — redirecting to login');
     if (!resp.ok) {
       throw new Error(`Failed to fetch models list: ${resp.status}`);
     }
@@ -533,6 +556,7 @@ class ChatAPI {
 
   async listIndexes(): Promise<{ indexes: any[]; total: number }> {
     const resp = await fetch(`${API_BASE_URL}/indexes`, { headers: authHeaders() });
+    if (handleAuthExpired(resp)) throw new Error('Session expired — redirecting to login');
     if (!resp.ok) {
       throw new Error(`Failed to list indexes: ${resp.status}`);
     }
@@ -541,6 +565,7 @@ class ChatAPI {
 
   async getSessionIndexes(sessionId: string): Promise<{ indexes: any[]; total: number }> {
     const resp = await fetch(`${API_BASE_URL}/sessions/${sessionId}/indexes`, { headers: authHeaders() });
+    if (handleAuthExpired(resp)) throw new Error('Session expired — redirecting to login');
     if (!resp.ok) throw new Error(`Failed to get session indexes: ${resp.status}`);
     return resp.json();
   }
